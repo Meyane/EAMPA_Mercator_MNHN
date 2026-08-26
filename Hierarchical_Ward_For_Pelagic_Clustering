@@ -1,0 +1,219 @@
+import xarray as xr
+import numpy as np
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+import geopandas as gpd
+from shapely.geometry import Point
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.impute import SimpleImputer
+from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
+
+# ---- DATA PREPARATION ----
+# Input file paths
+BATHY_PATH = r"bathy_EA.nc"
+SST_PATH = r"sst_EastAntarctica.nc"
+ICE_DIR = r"ice_EastAntarctica.nc"
+TARGET_RES = 0.1  # Target grid resolution (0.1°)
+
+# Define target grid for East Antarctica region
+lon_target = np.arange(0, 180 + TARGET_RES, TARGET_RES)
+lat_target = np.arange(-70, -50 + TARGET_RES, TARGET_RES)
+
+# --- Load Data ---
+# Load bathymetry, SST and sea ice data
+bathy_ds = xr.open_dataset(os.path.join(BATHY_PATH))
+bathy_da = bathy_ds["bathy"]
+# Fix dimension names (swap longitude/latitude if needed)
+bathy_da = bathy_da.rename({'longitude': 'latitude', 'latitude': 'longitude'})
+
+sst_ds = xr.open_dataset(os.path.join(SST_PATH))
+sst_da = sst_ds["sst"]
+sst_da = sst_da - 273.15  # Convert Kelvin to Celsius
+
+ice_ds = xr.open_dataset(os.path.join(ICE_DIR))
+ice_da = ice_ds["ice_conc"]
+ice_da = ice_da / 100.0  # Convert percentage to fraction (0-1)
+
+# --- Standardize Dimensions ---
+# Standardize dimension names to (latitude, longitude, time) for consistency
+def standardize_dims(da):
+    dim_map = {}
+    for d in da.dims:
+        # Map common dimension names to standardized names
+        if d in ["y", "lat", "latitude"]:
+            dim_map[d] = "latitude"
+        elif d in ["x", "lon", "longitude"]:
+            dim_map[d] = "longitude"
+        elif d in ["t", "time", "date", "datetime"]:
+            dim_map[d] = "time"
+    da = da.rename(dim_map) if dim_map else da
+
+    # Ensure spatial dimensions are ordered as (latitude, longitude)
+    spatial_dims = [d for d in da.dims if d in ["latitude", "longitude"]]
+    if len(spatial_dims) == 2 and spatial_dims == ["longitude", "latitude"]:
+        # Swap spatial dimensions while preserving non-spatial dims (e.g., time)
+        non_spatial = [d for d in da.dims if d not in spatial_dims]
+        da = da.transpose(*non_spatial, "latitude", "longitude")
+    return da
+
+# Apply dimension standardization to all datasets
+bathy_da = standardize_dims(bathy_da)
+sst_da = standardize_dims(sst_da)
+ice_da = standardize_dims(ice_da)
+
+# ---- Filter and Regrid Data --
+# Subset to 2011-2025 period
+sst_da = sst_da.sel(time=slice('2011-01-01', '2025-12-31'))
+ice_da = ice_da.sel(time=slice('2011-01-01', '2025-12-31'))
+
+# Regrid all datasets to the common target grid using nearest-neighbor interpolation
+common_coords = {"latitude": lat_target, "longitude": lon_target}
+bathy_da = bathy_da.reindex(**common_coords, method="nearest")
+sst_da = sst_da.reindex(**common_coords, method="nearest")
+ice_da = ice_da.reindex(**common_coords, method="nearest")
+
+# Compute temporal means for SST and sea ice
+sst_mean = sst_da.mean(dim="time", skipna=True)
+ice_mean = ice_da.mean(dim="time", skipna=True)
+
+# Convert to numpy arrays (2D) and apply transformations
+bathy_np = np.log10(abs(bathy_da.values)+ 1)  # Log10 transform of absolute bathymetry (to reduce skew)
+sst_np = sst_mean.values
+ice_np = ice_mean.values
+
+# --- Domain 7 mask ---
+DOMAIN7_SHAPEFILE = r"Domain7.gpkg"
+gdf = gpd.read_file(DOMAIN7_SHAPEFILE)
+if gdf.crs is None:
+    gdf.set_crs("EPSG:4326", inplace=True)
+else:
+    gdf = gdf.to_crs("EPSG:4326")
+
+domain_geom = gdf.geometry.union_all()  #Merge all geometries into one
+# Create grid for masking
+lon_grid, lat_grid = np.meshgrid(lon_target, lat_target)
+# Create mask: True where grid points are inside Domain 7
+mask_domain7 = np.array([
+    domain_geom.contains(Point(lon, lat))
+    for lon, lat in zip(lon_grid.ravel(), lat_grid.ravel())
+]).reshape(lon_grid.shape)
+
+# ---------------Hierarchical CLUSTERING--------------------------------------
+# Stack features into a 3D array (latitude, longitude, variable)
+data = np.stack([bathy_np, sst_np, ice_np], axis=-1)
+y_size, x_size = data.shape[0], data.shape[1]
+
+# Apply domain mask to extract only valid pixels
+data_masked = data[mask_domain7]
+y_indices, x_indices = np.indices((y_size, x_size))
+coords_domain7 = (y_indices[mask_domain7], x_indices[mask_domain7])
+
+# Flattend and preprocess data for clustering
+data_2d = data_masked.reshape(-1, data.shape[-1])  # Reshape to (n_samples, n_features)
+imputer = SimpleImputer(strategy="mean")  # Replace NaNs with mean
+data_imputed = imputer.fit_transform(data_2d)
+scaler = StandardScaler()  # Standardize features (mean=0, std=1)
+data_normalized = scaler.fit_transform(data_imputed)
+
+# Use a random sample for dendrogram visualization (to reduce computation)
+np.random.seed(42)
+sample_idx = np.random.choice(len(data_normalized), 65000, replace=False)
+data_sample = data_normalized[sample_idx]
+
+# Perform hierarchical clustering using Ward's Method
+Z = linkage(data_sample, method='ward')
+
+# Plot dendrogram to visualize cluster hierarchy
+plt.figure(figsize=(12, 6))
+dendrogram(
+    Z,
+    truncate_mode='lastp',
+    p=12,
+    show_leaf_counts=True,
+    leaf_rotation=90.,
+    leaf_font_size=8.,
+    show_contracted=True,
+)
+plt.title("Hierarchical Clustering Dendrogram (Ward, 65000 samples)")
+plt.xlabel("Cluster Size")
+plt.ylabel("Distance (Ward)")
+plt.tight_layout()
+plt.savefig("dendrogram_BathyLog10_20112025_65000.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# Assign cluster labels based on dendrogram analysis
+optimal_K = 11  # Given the dendrogram
+labels = fcluster(Z, t=optimal_K, criterion='maxclust')  # Assign cluster labels
+
+# Compute silhouette score to evaluate clustering quality
+score = silhouette_score(data_sample, labels)
+
+# --- Create Cluster Map ---
+# Initialize cluster map with NaN (for masked-out areas)
+cluster_map = np.full((y_size, x_size), np.nan)
+# Assign cluster labels to the sampled pixels within the domain
+sample_coords = (y_indices[mask_domain7][sample_idx], x_indices[mask_domain7][sample_idx])
+cluster_map[sample_coords[0], sample_coords[1]] = labels
+
+cluster_da = xr.DataArray(
+    cluster_map,
+    dims=("latitude", "longitude"),
+    coords={"latitude": lat_target, "longitude": lon_target},
+    name="bioregions",
+)
+
+cluster_da.rio.write_crs("EPSG:4326", inplace=True)
+cluster_da.rio.to_raster("pelagic_bioregions_HierarchicalONLY_K=11_BathyLog10_20112025_65000pts.tif", nodata=np.nan)
+print("Clustering saved")
+
+# --- Visualization: Violin Plots ---
+# Transform data back to original scale for interpretation
+data_original_scale = scaler.inverse_transform(data_sample)
+df_plot = pd.DataFrame(
+    data_original_scale,
+    columns=["Depth (m)", "SST (°C)", "Sea Ice"]
+)
+df_plot["Cluster"] = labels  # Add cluster labels
+
+# Plot violin plots for each feature by cluster
+fig, axes = plt.subplots(1, 3, figsize=(15, 6), sharey=True)
+for i, (var, title) in enumerate(zip(["Depth (m)", "SST (°C)", "Sea Ice"], ["A", "B", "C"])):
+    ax = axes[i]
+    sns.violinplot(
+        data=df_plot,
+        y="Cluster",
+        x=var,
+        inner="quartile",
+        ax=ax,
+        cut=0,
+        width=0.8,
+        orient='h',
+        order=sorted(df_plot["Cluster"].unique()),
+        palette="Set2"
+    )
+    ax.set_title(title)
+    ax.set_xlabel(var)
+    ax.set_ylabel("Cluster number" if i == 0 else "")
+    if var == "Depth (m)": ax.set_xlim(0, 4)
+    elif var == "SST (°C)": ax.set_xlim(-2, 5)
+    elif var == "Sea Ice": ax.set_xlim(0, 1)
+plt.suptitle("Attributes of pelagic regions identified by cluster analysis for East Antarctica Planning Domain")
+plt.tight_layout()
+plt.savefig("violin_plots_BathyLog10_20112025_65000.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# --- Cluster Statistics ----
+cluster_stats = df_plot.groupby('Cluster').agg(['mean', 'std', 'min', 'max']).round(2)
+print(cluster_stats)
+
+for cluster in sorted(df_plot['Cluster'].unique()):
+    cluster_data = df_plot[df_plot['Cluster'] == cluster]
+    print(f"\nCluster {cluster}:")
+    print(f"  Depth (m):   Mean={cluster_data['Depth (m)'].mean():.1f} ± {cluster_data['Depth (m)'].std():.1f} (min={cluster_data['Depth (m)'].min():.1f}, max={cluster_data['Depth (m)'].max():.1f})")
+    print(f"  SST (°C):    Mean={cluster_data['SST (°C)'].mean():.2f} ± {cluster_data['SST (°C)'].std():.2f} (min={cluster_data['SST (°C)'].min():.2f}, max={cluster_data['SST (°C)'].max():.2f})")
+    print(f"  Sea Ice:     Mean={cluster_data['Sea Ice'].mean():.2f} ± {cluster_data['Sea Ice'].std():.2f} (min={cluster_data['Sea Ice'].min():.2f}, max={cluster_data['Sea Ice'].max():.2f})")
