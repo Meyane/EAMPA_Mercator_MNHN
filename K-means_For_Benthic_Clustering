@@ -1,0 +1,197 @@
+import xarray as xr
+import numpy as np
+import pandas as pd
+import os
+import rioxarray
+import geopandas as gpd
+from pyproj import Transformer
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.impute import SimpleImputer
+from affine import Affine
+import matplotlib.pyplot as plt
+import seaborn as sns
+from rasterio.features import rasterize
+from scipy.spatial import cKDTree
+
+# --- Intput/Output Paths ---
+BATHY_PATH = r"C:/STAGE_Mercator.X.MHNH/bathy_EA.nc"
+GEOMORPH_SHAPES = {
+    "canyons": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Canyons.shp",
+    "seamounts": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Seamounts.shp",
+    "shelf_valleys": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Shelf_valleys.shp",
+    "ridges": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Ridges.shp",
+    "shelves": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Shelf.shp",
+    "fans": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Fans.shp",
+    "plateau": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Plateaus.shp",
+    "spreading_ridges": r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Spreading_ridges.shp"
+}
+TARGET_RES = 0.1  # target grid resolution (0.1°)
+OUTPUT_DIR = "C:/Users/mmarage"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- Load and Prepare Bathymetry ---
+# Open bathymetry data and correct dimension names (swap longitude/latitude if needed)
+bathy_da = rioxarray.open_rasterio(BATHY_PATH, mask_and_scale=True)
+ds = xr.open_dataset(BATHY_PATH)
+ds = ds.rename({"longitude": "lat_tmp", "latitude": "lon_tmp"})  # Temporary rename for swapping
+ds = ds.rename({"lat_tmp": "latitude", "lon_tmp": "longitude"})  # Final dimension names
+bathy_da = ds["bathy"]
+bathy_da = bathy_da.rio.write_crs("EPSG:4326")
+bathy_da = bathy_da.squeeze() # Remove singleton dimensions
+bathy_np = np.sqrt(np.abs(bathy_da.values))
+
+# Extract grid coordinates for spatial operations
+lon_target = bathy_da["longitude"].values
+lat_target = bathy_da["latitude"].values
+
+# --- Spatial Feature Extraction Functions ---
+# Compute distance from each grid cell to the nearest feature
+def compute_distance_to_feature(gdf, lon_grid, lat_grid):
+    gdf_projected = gdf.to_crs("EPSG:3031") # Project to Antarctic Steraographic for accurate distance calculations
+    feature_coords = np.array([(geom.centroid.x, geom.centroid.y) for geom in gdf_projected.geometry]) # EXtract centroi coordinates of features
+
+    # Project grid coordinates to EPSG:3031
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3031", always_xy=True)
+    grid_lons, grid_lats = np.meshgrid(lon_grid, lat_grid)
+    grid_coords = np.column_stack((grid_lons.ravel(), grid_lats.ravel()))
+    grid_coords_projected = np.array([transformer.transform(lon, lat) for lon, lat in grid_coords])
+
+    # Use KDTree for efficient nearest-neighbor distance calculation
+    tree = cKDTree(feature_coords)
+    distances, _ = tree.query(grid_coords_projected, k=1)  # Distance in meters
+    return distances.reshape(grid_lons.shape) / 1000  # Convert to kilometers
+
+# Rasterize a shapefile into a binary mask (1 if feature exists, 0 otherwise)
+def rasterize_shapefile(gdf, lon_grid, lat_grid):
+    shapes = [(geom, 1) for geom in gdf.geometry]
+    # Create affine transform for the target grid
+    transform = Affine.translation(lon_grid[0], lat_grid[0]) * Affine.scale(lon_grid[1] - lon_grid[0], lat_grid[1] - lat_grid[0])
+    raster = rasterize(shapes, out_shape=(len(lat_grid), len(lon_grid)), transform=transform)
+    return raster.astype(np.float32)
+
+# --- Compute Spatial Features ---
+# Initialize distance arrays for canyons and seamounts
+distance_to_canyons = np.zeros_like(bathy_np)
+distance_to_seamounts = np.zeros_like(bathy_np)
+
+# Dictionary to store binary masks for other features
+binary_features = {}
+for feature_name, shp_path in GEOMORPH_SHAPES.items():
+    gdf = gpd.read_file(shp_path).to_crs("EPSG:4326")
+    if feature_name in ["canyons", "seamounts"]: # Compute distance for these features
+        if feature_name == "canyons":
+            distance_to_canyons = compute_distance_to_feature(gdf, lon_target, lat_target)
+        elif feature_name == "seamounts":
+            distance_to_seamounts = compute_distance_to_feature(gdf, lon_target, lat_target)
+    else:  # Create binary mask for other features
+        binary_features[feature_name] = rasterize_shapefile(gdf, lon_target, lat_target)
+
+# --- Stack Features for Clustering ---
+# Combine all features into a single array for clustering
+feature_list = [
+    bathy_np,
+    distance_to_canyons,
+    distance_to_seamounts,
+    *binary_features.values()
+]
+feature_names = [
+    "depth_sqrt",
+    "distance_to_canyons",
+    "distance_to_seamounts",
+    *binary_features.keys()
+]
+# Stack features into a 3D array (height, width, n_features)
+data = np.stack(feature_list, axis=-1)
+
+# --- DOmain 7 Mask ---
+DOMAIN7_SHAPEFILE = r"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EnvironmentalManagement/CCAMLR/Domain7.gpkg"
+gdf_domain = gpd.read_file(DOMAIN7_SHAPEFILE).to_crs("EPSG:4326")
+domain_geom = gdf_domain.geometry.unary_union
+mask_domain7 = rasterize_shapefile(gdf_domain, lon_target, lat_target).astype(bool)
+
+# ---- Mask and Flatten Data for Clustering ---
+# Extract data within the domain mask
+y_indices, x_indices = np.where(mask_domain7)
+data_masked = data[y_indices, x_indices]  # Masked data (2D)
+coords_domain7 = (y_indices, x_indices)  # Coordinates of masked pixels
+
+# --- Preprocess Data ---
+# Reshape to 2D array (n_samples, n_features) and normalize
+data_2d = data_masked.reshape(-1, data.shape[-1])
+imputer = SimpleImputer(strategy="mean")  # Replace NaNs with mean
+data_imputed = imputer.fit_transform(data_2d)
+scaler = StandardScaler()  # Standardize features (mean=0, std=1)
+data_normalized = scaler.fit_transform(data_imputed)
+
+# ---- KMeans Clustering ---
+optimal_K = 12  # Number of clusters (predefined)
+kmeans = KMeans(n_clusters=optimal_K, n_init=10)  # Initialize K-Means with 10 random starts
+final_labels = kmeans.fit_predict(data_normalized)  # Assign cluster labels
+
+# --- Create Cluster Map ---
+# Initialize cluster map with NaN (for masked-out areas)
+cluster_map = np.full(bathy_np.shape, np.nan)
+# Assign cluster labels to the masked pixels
+cluster_map[y_indices, x_indices] = final_labels
+
+# Convert to xarrray DataArray for export
+cluster_da = xr.DataArray(
+    cluster_map,
+    dims=("y", "x"),
+    coords={"y": lat_target, "x": lon_target},
+    name="benthic_bioregions",
+)
+cluster_da.rio.write_crs("EPSG:4326", inplace=True)
+cluster_da.rio.to_raster(
+    os.path.join(OUTPUT_DIR, "benthic_bioregions_Kmeans_bathyNOsqrt.tif"),
+    nodata=np.nan
+)
+
+# --- Vizualisation: Violin Plots ---
+# Transform data back to original scale for interpretation 
+data_original_scale = scaler.inverse_transform(data_normalized)
+df_plot = pd.DataFrame(
+    data_original_scale[:, :3],
+    columns=["SQRT on Bathymetry (m)", "Canyon Distance (km)", "Seamount Distance (km)"]
+)
+df_plot["Cluster"] = final_labels  # Add cluster labels
+
+# Plot violin plots for each feature by cluster
+fig, axes = plt.subplots(1, 3, figsize=(15, 6), sharey=True)
+for i, (var, title) in enumerate(zip(["SQRT on Bathymetry (m)", "Canyon Distance (km)", "Seamount Distance (km)"], ["A", "B", "C"])):
+    ax = axes[i]
+    sns.violinplot(
+        data=df_plot,
+        y="Cluster",
+        x=var,
+        inner="quartile",
+        ax=ax,
+        cut=0,
+        width=0.8,
+        orient='h',
+        order=sorted(df_plot["Cluster"].unique()),
+        palette="Set2"
+    )
+    ax.set_title(title)
+    ax.set_xlabel(var)
+    ax.set_ylabel("Cluster number" if i == 0 else "")
+    if var == "SQRT on Bathymetry (m)": ax.set_xlim(0, 6000)
+    elif var == "Seamount Distance (km)": ax.set_xlim(0, 1200)
+    elif var == "Canyon Distance (km)": ax.set_xlim(0, 1200)
+plt.suptitle("Attributes of benthic regions identified by cluster analysis for East Antarctica Planning Domain")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "violin_plots_KMeans_bathyNOsqrt.png"), dpi=300, bbox_inches='tight')
+plt.close()
+
+# --- Cluster Statistics ---
+cluster_stats = df_plot.groupby('Cluster').agg(['mean', 'std', 'min', 'max']).round(2)
+print(cluster_stats)
+
+for cluster in sorted(df_plot['Cluster'].unique()):
+    cluster_data = df_plot[df_plot['Cluster'] == cluster]
+    print(f"\nCluster {cluster}:")
+    print(f"  Seamount Distance (km):    Mean={cluster_data['Seamount Distance (km)'].mean():.2f} ± {cluster_data['Seamount Distance (km)'].std():.2f} (min={cluster_data['Seamount Distance (km)'].min():.2f}, max={cluster_data['Seamount Distance (km)'].max():.2f})")
+    print(f"  SQRT on Bathymetry (m):    Mean={cluster_data['SQRT on Bathymetry (m)'].mean():.2f} ± {cluster_data['SQRT on Bathymetry (m)'].std():.2f} (min={cluster_data['SQRT on Bathymetry (m)'].min():.2f}, max={cluster_data['SQRT on Bathymetry (m)'].max():.2f})")
+    print(f"  Canyon Distance (km):   Mean={cluster_data['Canyon Distance (km)'].mean():.1f} ± {cluster_data['Canyon Distance (km)'].std():.1f} (min={cluster_data['Canyon Distance (km)'].min():.1f}, max={cluster_data['Canyon Distance (km)'].max():.1f})")
