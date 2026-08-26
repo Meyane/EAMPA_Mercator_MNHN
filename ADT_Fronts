@@ -1,1 +1,167 @@
+import multiprocessing
+import xarray as xr
+import numpy as np
+import geopandas as gpd
+import pandas as pd
+import rasterio
+from scipy.ndimage import maximum_filter
+from scipy.optimize import minimize
+from sklearn.cluster import KMeans
+from rasterio.features import shapes
+from shapely.geometry import shape
 
+# --- CONFIG ---
+FILE = "EAMPA_ADT_2003-2025_Obs.nc"
+N_WORKERS = 12  # Number of worker processes for parallel execution
+
+# Load dataset one to extract all time step and avoid reloading in each worker
+ds = xr.open_dataset(FILE)
+ds.rio.write_crs("WGS84", inplace=True)  # Set CRS to WGS84 for geospatial ops
+time_steps = ds["time"].values  # Extract all time steps as numpy array
+ds.close()
+
+# --- PROCESS SINGLE TIME STEP  ---
+def process_time_step(time_step):
+    try:
+        # Convert time step to datetime and extract year, month, day
+        time_step_dt = pd.to_datetime(time_step)
+        date_str = time_step_dt.strftime("%Y%m%d")
+        year = int(date_str[:4])
+        month = int(date_str[4:6])
+
+        # Only process the 1st of each month due to computer ressources constraints
+        if date_str[6:8] != "01":
+            return None
+        print(f"Processing {year}-{month:02d}-01")
+
+        # Re-open dataset in worker for multiprocessing safety
+        ds_worker = xr.open_dataset(FILE)
+        ds_worker.rio.write_crs("WGS84", inplace=True)
+
+        # Extract ADT for the current time step and subset to Antarctica region
+        adt = ds_worker["adt"].sel(time=time_step_dt)
+        adt_antarctica = adt.sel(latitude=slice(-70, -50), longitude=slice(0, 180))
+
+        # Compute gradient magnitude of ADT
+        dy, dx = np.gradient(adt_antarctica)
+        gradient_magnitude = np.sqrt(dx**2 + dy**2)
+        gradient_magnitude = np.nan_to_num(gradient_magnitude, nan=0.0)
+
+        # Detect local maxima in gradient (potential fronts) above a threshold
+        threshold = 0.005
+        data_max = maximum_filter(gradient_magnitude, size=3, mode='constant')
+        local_max = (gradient_magnitude == data_max) & (gradient_magnitude > threshold)
+        adt_at_fronts = adt_antarctica.values[local_max]  # ADT values at front locations
+
+        if len(adt_at_fronts) > 0:
+            # Cluster ADT values at fronts using K-means (max 6 clusters)
+            X = adt_at_fronts.reshape(-1, 1)
+            n_clusters = min(6, len(X))
+            if n_clusters > 1:
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(X)
+
+                # Cost function: Minimize difference between ADT contours and gradient coverage
+                def cost_function(adt_contours, gradient, adt, threshold=0.25):
+                    total_area = np.sum(gradient > threshold)
+                    if total_area == 0:
+                        return 1.0
+                    covered_area = 0
+                    for contour in adt_contours:
+                        # Count pixels where graient is high and ADR is close to contour value
+                        covered = np.logical_and(gradient > threshold, np.abs(adt - contour) < 0.05)
+                        covered_area += np.sum(covered)
+                    return 1 - (covered_area / total_area)  # Minimize uncovered area
+
+                # Optimize ADT contour values to best match gradient fronts
+                initial_guess = np.linspace(np.min(adt_at_fronts), np.max(adt_at_fronts), 10)
+                result = minimize(cost_function, initial_guess, args=(gradient_magnitude, adt_antarctica.values))
+                frontal_adt_values = result.x  # Optimal ADT contour values
+                print(f"  Frontal ADT values: {frontal_adt_values[:3]}...")
+
+                # Save outputs as GeoTIFF
+                adt_da = xr.DataArray(
+                    adt_antarctica,
+                    dims=("latitude", "longitude"),
+                    coords={"latitude": adt_antarctica.latitude, "longitude": adt_antarctica.longitude},
+                    name="adt"
+                )
+                adt_da.rio.write_crs("WGS84", inplace=True)
+                if "grid_mapping" in adt_da.attrs:
+                    del adt_da.attrs["grid_mapping"]  # Remove redundant grid mapping attribute
+                adt_da.rio.to_raster(f"adt_antarctica_{year}_{month:02d}.tif")
+
+                # Save frontal contours as shapefile
+                with rasterio.open(f"adt_antarctica_{year}_{month:02d}.tif") as src:
+                    adt_data = src.read(1)
+                    transform = src.transform
+                contours_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                for adt_val in frontal_adt_values:
+                    # Create mask for pixels close to current ADT contour value
+                    mask = np.isclose(adt_data, adt_val, atol=0.05)
+                    # Extract polygons from mask
+                    for shape_dict, _ in shapes(adt_data, transform=transform, mask=mask):
+                        if shape_dict["type"] == "Polygon":
+                            shapely_polygon = shape(shape_dict)
+                            gdf = gpd.GeoDataFrame(geometry=[shapely_polygon], crs="EPSG:4326")
+                            gdf["ssh_value"] = adt_val
+                            contours_gdf = pd.concat([contours_gdf, gdf], ignore_index=True)
+                contours_gdf.to_file(f"frontal_contours_{year}_{month:02d}.shp")
+
+                #Save gradient magnitude as GeoTIFF
+                gradient_da = xr.DataArray(
+                    gradient_magnitude,
+                    dims=("latitude", "longitude"),
+                    coords={"latitude": adt_antarctica.latitude, "longitude": adt_antarctica.longitude},
+                    name="gradient_magnitude"
+                )
+                gradient_da.rio.write_crs("WGS84", inplace=True)
+                gradient_da.rio.to_raster(f"gradient_magnitude_antarctica_{year}_{month:02d}.tif")
+
+        ds_worker.close()
+        return {
+            "year": year,
+            "month": month,
+            "gradient": gradient_magnitude,
+            "latitude": adt_antarctica.latitude.values,
+            "longitude": adt_antarctica.longitude.values
+        }
+    except Exception as e:
+        print(f"Error processing {time_step}: {str(e)}")
+        return None
+
+# --- MAIN: PARALLEL EXECUTION ---
+if __name__ == "__main__":
+    print(f"Processing {len(time_steps)} time steps with {N_WORKERS} workers...")
+    with multiprocessing.Pool(N_WORKERS) as pool:
+        # Process all time steps in parallel
+        results = pool.map(process_time_step, time_steps)
+
+    # Filter out skipped time steps (day != 01)
+    gradients = [r for r in results if r is not None]
+    if not gradients:
+        raise RuntimeError("No time steps with day=01 found! Check your data.")
+
+    latitude = gradients[0]["latitude"]
+    longitude = gradients[0]["longitude"]
+
+    def save_mean(mean_gradient, filename):
+        mean_da = xr.DataArray(
+            mean_gradient,
+            dims=("latitude", "longitude"),
+            coords={"latitude": latitude, "longitude": longitude},
+            name="mean_gradient"
+        )
+        mean_da.rio.write_crs("WGS84", inplace=True)
+        mean_da.rio.to_raster(filename)  # Fixed: to_raster (not ro_raster)
+        print(f"Saved {filename}")
+
+    gradients_2003 = [g["gradient"] for g in gradients if g["year"] == 2003]
+    gradients_2003_2010 = [g["gradient"] for g in gradients if 2003 <= g["year"] <= 2010]
+    gradients_2011_2025 = [g["gradient"] for g in gradients if 2011 <= g["year"] <= 2025]
+
+    if gradients_2003:
+        save_mean(np.mean(gradients_2003, axis=0), "mean_gradient_2003.tif")
+    if gradients_2003_2010:
+        save_mean(np.mean(gradients_2003_2010, axis=0), "mean_gradient_2003_2010.tif")
+    if gradients_2011_2025:
+        save_mean(np.mean(gradients_2011_2025, axis=0), "mean_gradient_2011_2025.tif")
