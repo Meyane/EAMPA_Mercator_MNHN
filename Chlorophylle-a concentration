@@ -1,0 +1,88 @@
+import copernicusmarine
+import xarray as xr
+import rioxarray as rxr
+
+"""
+# Download chlorophyll-a observations for Antarctica (2002-2025)
+copernicusmarine.subset(
+  dataset_id="cmems_obs-oc_glo_bgc-plankton_my_l4-multi-4km_P1M",  # Plankton, multi-sensor (4 km), monthly  
+  variables=["CHL"],
+  minimum_longitude=0,
+  maximum_longitude=180,
+  minimum_latitude=-70,
+  maximum_latitude=-50, 
+  start_datetime="2002-12-01",
+  end_datetime="2025-12-31",
+  minimum_depth=0,
+  maximum_depth=30,
+  output_filename = "EAMPA_CHL_2003-2025_Obs.nc",
+  output_directory = "C:/Users/mmarage/STAGE_Mercator.X.MHNH"
+)"""
+
+# --- Input/Output Paths ---
+file = "C:/STAGE_Mercator.X.MHNH/EAMPA_CHL_2003-2025_Obs.nc"
+output_dir = "C:/Users/mmarage"
+
+ds = xr.open_dataset(file)
+chlor = ds["CHL"]
+
+# --- Add Time Coordinates (if missing) ---
+# Add 'month' and 'year' coordinates for easier time-based selection
+if 'month' not in chlor.coords:
+    chlor = chlor.assign_coords(month=chlor.time.dt.month)
+if 'year' not in chlor.coords:
+    chlor = chlor.assign_coords(year=chlor.time.dt.year)
+chlor = chlor.rio.write_crs("WGS84", inplace=True)
+
+# --- Compute Austral Summer Means (Dec-Mar) for Each Year ---
+for year in range(2003, 2026):
+    # Select December of the previous year
+    dec = chlor.sel(time=(
+        (chlor.time.dt.year == year -1) &
+        (chlor.time.dt.month == 12)
+    ))
+    # Select Jan-Mar of the current year
+    summer = chlor.sel(time=(
+        (chlor.time.dt.year == year) &
+        (chlor.time.dt.month.isin([ 1, 2, 3]))
+    ))
+    # Combine
+    summer = xr.concat([dec, summer], dim='time')
+    # Compute means CHL for the austral summer
+    mean_summer = summer.mean(dim='time')
+    mean_summer.rio.to_raster(f"{output_dir}/{year}_dec-mar_mean.tif")
+
+# --- Compute Mean CHL for 2003-2010 (Dec-Mar) ---
+# Select December months for 2002-2009 (to include Dec 2002 for summer 2002-2003)
+dec_2002_2009 = chlor.sel(time=(
+    (chlor.time.dt.year >= 2002) &
+    (chlor.time.dt.year <= 2009) &
+    (chlor.time.dt.month == 12)
+))
+# Select Jan-Mar for 2003-2010
+jan_mar_2003_2010 = chlor.sel(time=(
+    (chlor.time.dt.year >= 2003) &
+    (chlor.time.dt.year <= 2010) &
+    (chlor.time.dt.month.isin([1, 2, 3]))
+))
+# Combine and compute mean for the 2003-2010 period
+period1 = xr.concat([dec_2002_2009, jan_mar_2003_2010], dim='time')
+mean_period1 = period1.mean(dim='time')
+mean_period1.rio.to_raster(f"{output_dir}/2003-2010_dec-mar_mean.tif")
+
+# --- Compute Mean CHL for 2011-2025 (Dec-Mar) ---
+dec_2010_2024 = chlor.sel(time=(
+    (chlor.time.dt.year >= 2010) &
+    (chlor.time.dt.year <= 2024) &
+    (chlor.time.dt.month == 12)
+))
+jan_mar_2011_2025 = chlor.sel(time=(
+    (chlor.time.dt.year >= 2011) &
+    (chlor.time.dt.year <= 2025) &
+    (chlor.time.dt.month.isin([1, 2, 3]))
+))
+period2 = xr.concat([dec_2010_2024, jan_mar_2011_2025], dim='time')
+mean_period2 = period2.mean(dim='time')
+mean_period2.rio.to_raster(f"{output_dir}/2011-2025_dec-mar_mean.tif")
+
+print("Processing complete !")
