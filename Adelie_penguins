@@ -1,0 +1,59 @@
+import pandas as pd
+import geopandas as gpd
+from shapely import LineString
+import numpy as np
+from rasterio.warp import transform as rio_transform
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+
+# Load your CSV file
+data = pd.read_csv("C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Adélie/Adelie_GLS_tracking.csv", sep=';', header=None)
+
+# If the data is in a single column with semicolon-separated values, split it
+if data.shape[1] == 1:
+    parsed_data = data[0].str.split(';', expand=True)
+    parsed_data.columns = [
+        'event-id', 'visible', 'timestamp', 'location-long', 'location-lat',
+        'migration-stage', 'sensor-type', 'individual-taxon-canonical-name',
+        'tag-local-identifier', 'individual-local-identifier', 'study-name'
+    ]
+else:
+    # If the data is already split into columns, use the appropriate column names
+    parsed_data = data
+    parsed_data.columns = [
+        'event-id', 'visible', 'timestamp', 'location-long', 'location-lat',
+        'migration-stage', 'sensor-type', 'individual-taxon-canonical-name',
+        'tag-local-identifier', 'individual-local-identifier', 'study-name'
+    ]
+
+# Convert location-long and location-lat to numeric
+parsed_data['location-long'] = pd.to_numeric(parsed_data['location-long'], errors='coerce')
+parsed_data['location-lat'] = pd.to_numeric(parsed_data['location-lat'], errors='coerce')
+
+# Convert timestamp to datatime and extract month
+parsed_data['timestamp'] = pd.to_datetime(parsed_data['timestamp'], errors = 'coerce')
+parsed_data['month'] = parsed_data['timestamp'].dt.month
+
+# Sort by 'tag-local-identifier' and 'timestamp'
+grouped_data = parsed_data.sort_values(['tag-local-identifier', 'timestamp'])
+
+# Iterate over each unique tag-local-identifier
+for tag, group in parsed_data.groupby('tag-local-identifier'):
+    lines = []
+    for month, month_group in group.groupby('month'):
+        if len(month_group) >= 2:
+            line = LineString(zip(month_group['location-long'], month_group['location-lat']))
+            lines.append({
+                'geometry':line,
+                'tag-local-identifier': tag,
+                'month': month
+            })
+
+    # Create a GeoDataFrame
+    if lines:
+        lines_gdf = gpd.GeoDataFrame(lines, crs="EPSG:4326")
+
+    # Save the GeoDataFrame to a GeoJSON file
+        output_filename = f'penguin_tracks_individual_{tag}.geojson'
+        lines_gdf.to_file(output_filename, driver='GeoJSON')
