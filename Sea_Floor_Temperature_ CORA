@@ -1,0 +1,124 @@
+import os
+import copernicusmarine
+import cftime
+import rioxarray as rxr
+import xarray as xr
+import glob
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from shapely.geometry import box
+from scipy import stats
+from scipy.interpolate import griddata
+from rasterio.features import rasterize
+from rasterio.crs import CRS
+from rasterio.plot import show
+from rasterio.warp import reproject, Resampling
+
+"""
+# Downloads ocean temperature observations from CORA dataset for East Antarctica
+copernicusmarine.subset(
+  dataset_id="cmems_obs-ins_glo_phy-temp-sal_my_cora-oa_P1M",  # Obs
+  variables=["TEMP"],  # Obs
+  minimum_longitude=0,
+  maximum_longitude=180,
+  minimum_latitude=-70,
+  maximum_latitude=-50, 
+  start_datetime="2003-01-01",
+  end_datetime="2024-12-31",
+  minimum_depth=0,
+  maximum_depth=5500,
+  output_filename = "EAMPA_CORA_TempSeaFloor_2003-2025_Obs.nc",
+  output_directory = "C:/Users/mmarage/STAGE_Mercator.X.MHNH"
+)"""
+
+# Find deepest depth index with valid (non-NaN) data for each (y, x) location
+# Args: da: xarray DataArray with dimensions (depth, y, x)
+# Returns: depth_idx: 2D numpy array of depth indices (same shape as y, x)
+def find_deepest_non_nan_index(da):
+    mask = ~np.isnan(da.values)  # Create boolean mask for non-NaN values
+    mask_2d = mask[0]  # Extract mask  for the first time step (assumes consistent across time)
+    depth_idx = np.argmax(mask_2d[::-1, :, :], axis=0)  # Find the deepest valid depth index by reversing the depth axis
+    depth_idx = (mask_2d.shape[0] - 1) - depth_idx  # Convert back to original depth indexing
+    return depth_idx
+
+# --- Spatial Bounds for East Antarctica ---
+min_lon = 0
+max_lon = 180
+min_lat = -70
+max_lat = -50
+
+# -- Load and Preprocess Bathymetry ---
+bathymetry_da = rxr.open_rasterio("C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Bathymetry/IBCSO_bed_2025.tif", masked=True).squeeze()  # Open and remove singleton dimensions
+bathymetry_da.rio.write_crs("EPSG:9354", inplace=True)
+bathymetry_da = bathymetry_da.where(bathymetry_da != -32768, np.nan)  # Replace fill value (-32768) with NaN
+bathymetry_da = bathymetry_da.rio.reproject("EPSG:4326")
+bathymetry_da = bathymetry_da.rio.clip_box(minx=min_lon, maxx=max_lon, miny=min_lat, maxy=max_lat)
+
+# --- Load and Preprocess Temperature Data --
+file = "C:/STAGE_Mercator.X.MHNH/EAMPA_CORA_TempSeaFloor_2003-2025_Obs.nc"
+ds_input = xr.open_dataset(file, decode_times=False)  # Disable auto time decoding
+# Extract time values and decode using cftime (handles non-standard calendars)
+time_values = ds_input["time"].values
+time_units = ds_input["time"].attrs["units"]
+calendar = ds_input["time"].attrs.get("calendar", "360_day")
+ds_input["time"] = cftime.num2date(time_values, units=time_units, calendar=calendar)
+ds_input = ds_input.sel(time=slice("2015-01-01", "2022-12-31"))  # Subset
+
+# Extract temperature variable and prepare for geospatial operations
+t_sea = ds_input["TEMP"]
+t_sea = t_sea.rename({"longitude": "x", "latitude": "y"})  # Rename dimensions for consistency with rioxarray
+t_sea.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+t_sea.rio.write_crs("EPSG:4326", inplace=True)
+
+# Reproject bathymetry to match temperature data resolution
+bathymetry_da_reprojected = bathymetry_da.rio.reproject_match(t_sea)
+
+# --- Extract Bottom Temperature --
+# Find the deepest depth index with valid data for each location 
+depth_idx = find_deepest_non_nan_index(t_sea)
+# COnvert to xarray DataArray for indexing
+depth_idx_da = xr.DataArray(depth_idx, dims=("y", "x"), coords={"y": t_sea.y, "x": t_sea.x})
+# Extract bottom temperature using the depth indices
+t_sea_bottom = t_sea.isel(depth=depth_idx_da)
+
+# Sort and prepare for geospatial export
+t_sea_bottom = t_sea_bottom.sortby("x").sortby("y")
+t_sea_bottom.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+t_sea_bottom.rio.write_crs("EPSG:4326", inplace=True)
+t_sea_bottom.rio.write_transform(inplace=True)
+
+# -- Save Results ---
+output_dir = "C:/Users/mmarage"
+os.makedirs(output_dir, exist_ok=True)
+
+# Compute and save mean bottom temperature
+t_sea_bottom_mean = t_sea_bottom.mean(dim="time")
+t_sea_bottom_mean.rio.to_raster(
+    os.path.join(output_dir, "T_Sea_Bottom_EAMPA_CORA_2015-2022.tif"),
+    nodata=np.nan
+)
+
+print("Saved bottom temperature")
+
+# -- Depth-level temperatures ---
+for depth_idx in range(len(t_sea.depth)):
+    t_sea_depth = t_sea.isel(depth=depth_idx)  # EXtract temperature at current depth level
+    # Clear attributes and encoding to avoid metadata conflicts
+    t_sea_depth.attrs = {}
+    t_sea_depth.encoding = {}
+
+    t_sea_depth = t_sea_depth.sortby("x").sortby("y")
+    t_sea_depth.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+    t_sea_depth.rio.write_crs("EPSG:4326", inplace=True)
+    t_sea_depth.rio.write_transform(inplace=True)
+    output_filename_depth = f"T_Sea_Depth_{depth_idx}_EAMPA_CORA_2015-2022.tif"
+    t_sea_depth.rio.to_raster(
+        os.path.join(output_dir, output_filename_depth),  # One band for each month
+        dtype='float32',
+        nodata=np.nan
+    )
+    print(f"Saved depth level {depth_idx}: {output_filename_depth}")
+
+print("All GeoTIFF files generated!")
