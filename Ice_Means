@@ -1,0 +1,53 @@
+import xarray as xr
+import glob
+
+# Option if single file used
+#siconc_all = xr.open_dataset("C:/STAGE_Mercator.X.MHNH/EAMPA_Ice_2023-2026_Obs.nc")
+#siconc = siconc_all["ice_conc"]
+#siconc = siconc.rename({"longitude": "x", "latitude": "y"})
+#siconc.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+#siconc.rio.write_crs("EPSG:4326", inplace=True)
+
+#--------------------------------------------------------------------------------------------
+# Option if multiple files used
+files = glob.glob("202101-202303/*.nc") 
+
+# Open multiple files as asignel dataset (combined by coordinates)
+siconc_all = xr.open_mfdataset(files, combine="by_coords", chunks={"time": 10})
+print("step 1")
+
+# --- Define Spatial Bounds ---
+# East Antarctica region bounds
+min_lon, max_lon = 0, 180
+min_lat, max_lat = -70, -50
+
+# --- Create Spatial Mask ---
+# Create boolean masks for longitude and latitude bounds
+mask_lon = (siconc_all.lon >= min_lon) & (siconc_all.lon <= max_lon)
+mask_lat = (siconc_all.lat >= min_lat) & (siconc_all.lat <= max_lat)
+# Combine masks
+mask = mask_lon & mask_lat
+mask = mask.compute()  # Compute the mask explicitly
+
+# --- Extract and Process Ice Concentration ---
+# EXtract ice concentration variable and apply spatial mask (drop NaN values)
+siconc = siconc_all["ice_conc"].where(mask, drop=True)  # Obs
+
+# --- Prepare for Geospatial Operations --
+siconc = siconc.rename({"xc": "x", "yc": "y"})  # Rename dimensions for rioxarray compatibility
+siconc.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)  # Set spatial dimensions for geospatial operations
+siconc = siconc.assign_coords({"x": siconc.lon, "y": siconc.lat})  # Assign explicit x and y coordinates (using lon/lat values)
+siconc.rio.write_crs("EPSG:4326", inplace=True)  # Set coordinate reference system to WGS84
+
+# --- Group by Month and Calculate Monthly Means --
+grouped = siconc.groupby(siconc.time.dt.strftime('%Y-%m')) # Group data by year-month (e.g., "2021-01", etc.)
+monthly_means = grouped.mean('time')  # Calculate monthly means
+
+# -- Save Monthly Means ---
+for year_month, group in grouped:
+    year, month = year_month.split('-')  # Save each monthly mean as a separate NetCDF file 
+    if 'grid_mapping' in group.attrs:
+        group.attrs.pop('grid_mapping')
+    output_file = f'mean_ice_conc_month_{year}_{month}.nc'
+    group.to_netcdf(output_file)
+    print(f'Saved {output_file}')
