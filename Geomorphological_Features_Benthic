@@ -1,0 +1,78 @@
+import os
+import numpy as np
+import geopandas as gpd
+import rasterio
+import xarray as xr
+from rasterio.features import rasterize
+from shapely.validation import make_valid
+
+# --- Input/Output Configuration ---
+# Dictionary mapping shapefile paths to feature names
+shapefiles = {"C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Plateaus.shp": "Plateaus",
+              "C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Ridges.shp": "Ridges",
+              "C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Spreading_ridges.shp": "Spreading_Ridges",
+              "C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Fans.shp": "Fans",
+              "C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Shelf.shp": "Shelf",
+              "C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Shelf_valleys.shp": "Shelf_Valleys"
+}
+
+output_nc = "features_benthic.nc"
+output_dir = "C:/Users/mmarage"
+os.makedirs(output_dir, exist_ok=True)
+
+# -- Parameters --
+target_resolution = 0.1  # Target grid resolution in degrees (0.1°)
+
+# --- Calculate Combined Bounds ---
+# Collect bounds from all shapefils to create a commun grid
+all_bounds = []
+for shp_path in shapefiles.keys():
+    gdf = gpd.read_file(shp_path)
+    all_bounds.append(gdf.total_bounds)
+    gdf.crs = gdf.crs if gdf.crs else "EPSG:4326"  # Ensure each GeoDataFrame has a CRS
+
+# Calculate the overall bounding box from all shapefiles
+minx = min([b[0] for b in all_bounds])
+miny = min([b[1] for b in all_bounds])
+maxx = max([b[2] for b in all_bounds])
+maxy = max([b[3] for b in all_bounds])
+
+# --- Create Target Grid ---
+# Calculate grid dimensions based on the combined bounds
+width = int(np.ceil((maxx - minx) / target_resolution))  # Number of columns
+height = int(np.ceil((maxy - miny) / target_resolution))  # Number of rows
+# Create affine transform for the target grid (upper-left origin)
+transform = rasterio.transform.from_origin(minx, maxy, target_resolution, target_resolution)
+
+# --- Rasterize Each Feature ----
+# Dictionary to store binary raster layers for each feature
+binary_layers = {}
+for shp_path, feature_name in shapefiles.items():
+    gdf = gpd.read_file(shp_path)
+    shapes = [(geom, 1) for geom in gdf.geometry]  # Create shapes for rasterization: (geometry, value) pairs
+    raster = rasterize(  # Rasterize the feature: 1 = feature present, 0 = feature absent
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+    )
+    # Store the raster with its feature name and dimensions (y, x)
+    binary_layers[feature_name] = (["y", "x"], raster.astype(np.uint8))
+
+# -- Create Coordinate Arrays --
+# Create coordinate arrays centered on pixel centers (not edges)
+coords = {"x": np.linspace(minx + target_resolution/2, maxx - target_resolution/2, width),  # Longitude coordinates (centered)
+          "y": np.linspace(maxy - target_resolution/2, miny + target_resolution/2, height),}  # Latitude coordinates (centered)
+
+# -- Saving ---
+ds = xr.Dataset(
+    binary_layers,
+    coords=coords,
+    attrs={"description": "Binary layers for geological features (1=present, 0=absent)"},
+)
+
+ds.to_netcdf(
+    os.path.join(output_dir, output_nc)
+)
+print("DONE")
