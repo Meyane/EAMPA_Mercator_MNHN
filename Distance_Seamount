@@ -1,0 +1,95 @@
+import os
+import numpy as np
+import geopandas as gpd
+import rasterio
+import xarray as xr
+from rasterio.features import rasterize
+from scipy.ndimage import distance_transform_edt
+
+# -- Input/Output Configuration --
+input_shp = "C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Seamounts.shp"
+output_tif = "seamount_distance_50km.tif"
+output_nc = "seamount_distance_50km.nc"
+output_dir = "C:/Users/mmarage"
+os.makedirs(output_dir, exist_ok=True)
+
+# -- Parameters --
+target_resolution = 0.1  # Target grid resolution in degrees (0.1°)
+max_distance_km = 50  # Maximum distance to compute
+buffer_m = max_distance_km * 1000  # Convert to meters for distance calculation 
+
+# -- Load an Prepare Input Data
+gdf = gpd.read_file(input_shp)
+gdf.crs = gdf.crs if gdf.crs else "EPSG:4326"
+
+# --- Create Target Grid --
+# Calculate grid bounds and dimensions from the shapefile
+xmin, ymin, xmax, ymax = gdf.total_bounds
+width = int(np.ceil((xmax - xmin) / target_resolution))  # Number of columns
+height = int(np.ceil((ymax - ymin) / target_resolution))  # Number of rows
+# Create affine transform for the target grid (upper-lift origin)
+transform = rasterio.transform.from_origin(xmin, ymax, target_resolution, target_resolution)
+
+# --- Rasterize Seamounts ---
+# Convert seamount geometries to raster format (1 = seamount, 0 = no seamount)
+shapes = [(geom, 1) for geom in gdf.geometry]
+mask = rasterize(
+    shapes,
+    out_shape=(height, width),
+    transform=transform,
+    fill=0,
+    dtype=np.uint8
+)
+
+# --- Compute Distance to Nearest Seamount --
+# Invert mask: 1 = no seamount, 0 = seamount (required for distance_transform_edt)
+inverted_mask = 1 - mask
+
+# Calculate meter per degree for accurate distance computation
+avg_lat = (ymax + ymin) / 2  # Average latitude for the region
+earth_radius = 6371000  # meters
+meters_per_deg_lat = np.pi * earth_radius / 180  # Meters per degree of latitude (~111320 m)
+meters_per_deg_lon = meters_per_deg_lat * np.cos(np.radians(avg_lat))  # Meters per degree of longitude (varies with latitude)
+sampling = (meters_per_deg_lon * target_resolution, meters_per_deg_lat * target_resolution)  # Sampling distance in meters for each pixel
+
+# Compute Euclidean distance tranform (in meters)
+dist_meters = distance_transform_edt(inverted_mask, sampling=sampling)
+# Truncate distances at the maximum distance (50km)
+dist_meters_truncated = np.minimum(dist_meters, buffer_m)
+
+# -- Saving ---
+# GeoTIFF
+with rasterio.open(
+    os.path.join(output_dir, output_tif),
+    "w",
+    driver="GTiff",
+    height=height,
+    width=width,
+    count=1,
+    dtype=dist_meters_truncated.dtype,
+    crs=gdf.crs,
+    transform=transform,
+) as dst:
+    dst.write(dist_meters_truncated, 1)
+
+# NetCDF
+x_coords = np.linspace(xmin, xmax, width)
+y_coords = np.linspace(ymin, ymax, height)
+
+ds = xr.Dataset(
+    {
+        "distance": (["y", "x"], dist_meters_truncated),
+    },
+    coords={
+        "x": x_coords,
+        "y": y_coords,
+    },
+)
+ds.attrs["crs"] = str(gdf.crs)
+ds["distance"].attrs["units"] = "meters"
+ds["distance"].attrs["long_name"] = "Distance to nearest seamount"
+
+nc_path = os.path.join(output_dir, output_nc)
+ds.to_netcdf(nc_path)
+
+print("DONE")
