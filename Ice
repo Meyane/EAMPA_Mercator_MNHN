@@ -1,0 +1,307 @@
+import copernicusmarine
+import xarray as xr
+import glob
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+import geopandas as gpd
+import rasterio
+import re
+from rasterio.features import shapes
+from scipy.interpolate import griddata
+from shapely.geometry import LineString
+
+# Downloads sea ice concentration data from multiple datasets
+#copernicusmarine.subset(
+#  dataset_id="cmems_mod_glo_phy_my_0.083deg_P1D-m",  # Model
+#  dataset_id="osisaf_obs-si_glo_phy_sic-south_my_amsr_cdr_P1D-m",  # Obs 2003 - 2020
+#  dataset_id="osisaf_obs-si_glo_phy-sic-south_nrt_amsr2_l4_P1D-m",  # Obs 2023 - 2026
+#  variables=["siconc"],  # Model
+#  variables=["ice_conc"],  # Obs
+#  minimum_longitude=0,
+#  maximum_longitude=180,
+#  minimum_latitude=-70,
+#  maximum_latitude=-50, 
+#  start_datetime="2023-04-01",
+#  end_datetime="2026-01-01",
+#  minimum_depth=0,
+#  maximum_depth=30,
+#  output_filename = "EAMPA_Ice_2023-2026_Obs.nc",
+#  output_directory = "STAGE_Mercator.X.MHNH"
+#)
+
+# -- Input/Output Configuration ---
+INPUT_DIR = "C:/STAGE_Mercator.X.MHNH/Data/Mean_Trend_Ice_2003-2026"
+OUTPUT_DIR = "C:/Users/mmarage"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# -- Target Grid Configuration ---
+TARGET_RES = 0.1  # Target grid resolution in degrees (0.1°)
+lon_target = np.arange(0, 180 + TARGET_RES, TARGET_RES)
+lat_target = np.arange(-70, -50 + TARGET_RES, TARGET_RES)
+
+# --- Helper Functions ---
+# Extract date (YYYY-MM) from filename
+# Args: filepath: Path to the input file
+# Returns: Date string in YYYY-MM format
+# Raises: ValueError: If date cannot be extracted from filename
+def extract_date_from_filename(filepath: str) -> str:
+    basename = os.path.basename(filepath)
+    # Exemple : "mean_ice_conc_month_2023_02.nc" -> "2023-02"
+    match = re.search(r'(\d{4})[_-](\d{1,2})', basename)
+    if match:
+        year, month = match.groups()
+        return f"{year}-{month.zfill(2)}"
+    # Exemple : "mean_ice_conc_202302.nc" -> "2023-02"
+    match = re.search(r'(\d{4})(\d{2})', basename)
+    if match:
+        year, month = match.groups()
+        return f"{year}-{month}"
+    raise ValueError(f"Impossible d'extraire la date depuis : {basename}")
+
+# Regrid a DataArray tot the target grid using nearest-neighbor interpolation
+# Args: da: Input xarray DataArray; lon_target: Target longitude coordinates; lat_target: Target latitude coordinates
+# Returns: Regridded DataArray with target grid
+def regrid_to_target(da, lon_target, lat_target):
+    coord_names = {  # Map of possible coordinate names
+        'latitude': ['latitude', 'lat', 'y', 'yc'],
+        'longitude': ['longitude', 'lon', 'x', 'xc']
+    }
+    # Find actal coordinate names in the DataArray
+    lat_name = next((name for name in coord_names['latitude'] if name in da.coords), None)
+    lon_name = next((name for name in coord_names['longitude'] if name in da.coords), None)
+
+    if not lat_name or not lon_name:
+        raise ValueError(f"Coordonnées lat/lon introuvables dans {da.name}. Disponibles : {list(da.coords.keys())}")
+
+    # Extract coordinate and data values
+    lats = da[lat_name].values
+    lons = da[lon_name].values
+    vals = da.values
+
+    # Flatten for griddata
+    if lats.ndim == 1 and lons.ndim == 1:
+        lon_grid_2d, lat_grid_2d = np.meshgrid(lons, lats)  # Create 2D grid if coordinates are 1D
+        lons_flat = lon_grid_2d.flatten()
+        lats_flat = lat_grid_2d.flatten()
+    else:
+        lons_flat = lons.flatten()
+        lats_flat = lats.flatten()
+
+    vals_flat = vals.flatten()
+
+    # Filter out NaN values
+    valid_mask = ~(np.isnan(lats_flat) | np.isnan(lons_flat) | np.isnan(vals_flat))
+    lons_flat = lons_flat[valid_mask]
+    lats_flat = lats_flat[valid_mask]
+    vals_flat = vals_flat[valid_mask]
+
+    if len(lats_flat) == 0:
+        raise ValueError(f"Aucune donnée valide après filtrage des NaN pour {da.name}")
+
+    # Regrid using nearest-neighbor interpolation
+    lon_grid, lat_grid = np.meshgrid(lon_target, lat_target)
+    regridded = griddata(
+        (lons_flat, lats_flat),
+        vals_flat,
+        (lon_grid, lat_grid),
+        method='nearest',
+        fill_value=np.nan
+    )
+
+    return xr.DataArray(
+        regridded,
+        dims=("latitude", "longitude"),
+        coords={"latitude": lat_target, "longitude": lon_target},
+        name=da.name
+    )
+
+#---- Load and Process Ice Concentration Data ---
+
+#siconc_all = xr.open_dataset("C:/STAGE_Mercator.X.MHNH/EAMPA_Ice_2003-2020_Obs.nc")  # If just one file
+files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.nc")))  # If multiple files
+ice_datasets = []
+
+for file in files:
+    try:
+        # Open dataset with chunking for memory efficiency
+        ds = xr.open_dataset(file, chunks={"time":10, "y": 50, "x": 50})
+        # Determine the variable name (either 'ice_conc' or the first variable)
+        var_name = "ice_conc" if "ice_conc" in ds.data_vars else list(ds.data_vars)[0]
+        da = ds[var_name]
+
+        # Handle multi-temporal files by averaging over time
+        if 'time' in da.dims and da.sizes['time'] > 1:
+            da = da.mean(dim='time', keep_attrs=True).squeeze(drop=True)
+
+        # EXtract date from filename
+        date_str = extract_date_from_filename(file)
+        if '-' not in date_str:
+            date_str = f"{date_str[:4]}-{date_str[4:]}"
+
+        # Regrid to target grid
+        regridded_da = regrid_to_target(da, lon_target, lat_target)
+        ice_da = regridded_da.expand_dims(time=[np.datetime64(date_str)])  # Add time dimension
+
+        ice_datasets.append(ice_da)
+        print(f"✅ {os.path.basename(file)} traité. Forme : {ice_da.shape}")
+
+    except Exception as e:
+        print(f"❌ Erreur avec {os.path.basename(file)} : {str(e)[:200]}...")
+        continue
+
+# Concatenate all datasets along time dimension
+siconc_all = xr.concat(ice_datasets, dim="time", combine_attrs="drop_conflicts", coords="minimal")
+siconc_all = siconc_all.sel(time=slice("2003-01-01", "2025-12-31"))
+siconc_all = siconc_all.to_dataset(name='ice_conc')  # Resample to monthly frequency
+siconc_all = siconc_all.resample(time='1MS').mean()  # Extract the ice concentration DatArray
+
+
+#---------------------------------------------------------------------------------------------------
+# -- Isoline Generation Function ---
+# Generate isolines from a 2D data array and shave as shapefile
+# Args: data: xarray DataArray with 2D data; output_shapefile: Output shapefile path; level: Contour level (default: 0.15 = 15% ice concentration)
+def generate_isolines(data, output_shapefile, level=0.15):
+    plt.figure()  #Generate contour at specified level
+    contour = plt.contour(data.x, data.y, data, levels=[level])
+    plt.close()
+
+    # Convert contour segments to LineString
+    isolines = []
+    for seg_group in contour.allsegs:
+        for seg in seg_group:
+            isolines.append(LineString(seg))
+
+    gdf_isolines = gpd.GeoDataFrame(geometry=isolines, crs="EPSG:4326")
+    gdf_isolines.to_file(output_shapefile)
+
+# --- Generate Monthly Isolines (Mean and Median)
+# Group by month
+siconc_monthly = siconc_all.groupby("time.month")
+
+for month, siconc_month in siconc_monthly:
+    # Calculate mean and median concentration for each grid
+    mean_concentration = siconc_month.mean(dim="time")  
+    median_concentration = siconc_month.median(dim="time")  
+
+    # Generate isolines for mean and median
+    generate_isolines(mean_concentration, f"mean_ice_concentration_isolines_month_{month:02d}_Obs.shp")
+    generate_isolines(median_concentration, f"median_ice_concentration_isolines_month_{month:02d}_Obs.shp")
+print("Processing complete for Isolines. GeoTIFF files saved for each month.")
+
+# ---- Generate Monthly Ice Concnetration Maps and Isolines ---
+# Calculate monthly means across all years
+siconc_monthly = siconc_all.groupby("time.month").mean(dim="time")
+
+for month in range(1, 13):
+    monthly_data = siconc_monthly.sel(month=month)
+    monthly_data.rio.write_crs("EPSG:4326", inplace=True)
+    monthly_data.rio.to_raster(
+        f"ice_concentration_month_{month:02d}_Obs.tif",
+        dtype='float32',
+        nodata=np.nan
+    )
+    # Generate isolines at 15%, 17% and 75% concentration
+    generate_isolines(monthly_data, f"isoline_17_month_{month:02d}.shp", level=17)
+    generate_isolines(monthly_data, f"isoline_75_month_{month:02d}.shp", level=75)
+    generate_isolines(monthly_data, f"isoline_15_month_{month:02d}.shp", level=15)
+
+print("Processing complete for Ice Concentration. GeoTIFF and isolines saved for each month.")
+
+# --- Generate April-October Ice COncentration Map and Isolines
+#Select April-October months (austral winter)
+siconc_apr_oct = siconc_all.where(siconc_all.time.dt.month.isin(range(4, 11)), drop=True)
+siconc_apr_oct = siconc_apr_oct.mean(dim="time")
+siconc_apr_oct.rio.write_crs("EPSG:4326", inplace=True)
+siconc_apr_oct.rio.to_raster(
+    "ice_concentration_apr_oct_Obs.tif",
+    dtype='float32',
+    nodata=np.nan
+)
+# Generate isolines at 17% and 75% concentration
+generate_isolines(siconc_apr_oct, f"isoline_17_apr_oct.shp", level=17)
+generate_isolines(siconc_apr_oct, f"isoline_75_apr_oct.shp", level=75)
+
+print("Processing complete for April to October Ice Concentration.")
+
+# ---- Calculate Ice Extent --
+
+siconc_da = siconc_all["ice_conc"]
+earth_radius_km = 6371.0
+
+# Calculate celle areas accounting for latitude
+lat_rad = np.deg2rad(siconc_da.latitude)
+dlon = np.abs(siconc_da.longitude[1] - siconc_da.longitude[0])  # Longitude step in degrees
+lat_step = np.abs(siconc_da.latitude[1] - siconc_da.latitude[0])  # Latitude step in degrees
+
+# Calculate are of each celle in km² (1D array for latitude)
+cell_area_km2_1d = (
+    (earth_radius_km ** 2) *
+    np.deg2rad(dlon) *
+    (np.sin(np.deg2rad(siconc_da.latitude + lat_step/2)) - np.sin(np.deg2rad(siconc_da.latitude - lat_step/2)))
+)
+cell_area_km2 = np.tile(cell_area_km2_1d, (len(siconc_da.longitude), 1)).T  # Expand to 2D array (latitude, longitude)
+
+# Calculate ice extent time series
+ice_threshold = 0.15  # 15% ice concentration threshold for extent calculation
+ice_extent_km2 = []
+
+for time_step in siconc_da.time:
+    ice_conc = siconc_da.sel(time=time_step)
+    extent_mask = ice_conc >= ice_threshold
+    extent_km2 = np.nansum(extent_mask.values * cell_area_km2) / 1e6  # Convert to million km²
+    ice_extent_km2.append(extent_km2)
+
+# Create time series DataArray
+ice_extent_ts = xr.DataArray(
+    ice_extent_km2,
+    dims=["time"],
+    coords={"time": siconc_da.time},
+    name="ice_extent",
+    attrs={"units": "million km²", "long_name": "Sea Ice Extent"},
+)
+
+# --- Plot Ice Extent Time Series ---
+plt.figure(figsize=(14,7))
+plt.plot(ice_extent_ts.time, ice_extent_ts.values, marker="o", linestyle="-",
+         color="b", label="Extension mensuelle de glace de mer en fonction du temps (2003-2025)")
+
+# Customize plot
+plt.title("Évolution de l'extension mensuelle de glace (2003-2025)", fontsize=14)
+plt.xlabel("Mois", fontsize=12)
+plt.ylabel("Étendue de glace (millions de km²)", fontsize=12)
+plt.grid(True, linestyle="--", alpha=0.7)
+plt.gca().xaxis.set_major_locator(mdates.YearLocator(2))  # Every 2 years
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+plt.gca().xaxis.set_minor_locator(mdates.MonthLocator(interval=3))  # Every 3 months
+plt.gcf().autofmt_xdate()
+plt.legend()
+plt.tight_layout()
+output_figure_path = os.path.join(OUTPUT_DIR, "evolution_extension_glace_2003-2025.png")
+plt.savefig(output_figure_path, dpi=300, bbox_inches="tight")
+plt.show
+
+# --- Plot Mean Ice Concentration Time Series ---
+siconc_ts = siconc_all["ice_conc"]
+global_mean_ts = siconc_ts.mean(dim=("latitude", "longitude"))  # Calculate spatial mean for each time step
+
+plt.figure(figsize=(14,7))
+plt.plot(global_mean_ts.time, global_mean_ts.values, marker="o", linestyle="-",
+         color="b", label="Concentration mensuelle en fonction du temps (2003-2025)")
+
+# Customize plot
+plt.title("Évolution de la concentration moyenne de glace (2003-2025)", fontsize=14)
+plt.xlabel("Mois", fontsize=12)
+plt.ylabel("Concentration de glace (%)", fontsize=12)
+plt.grid(True, linestyle="--", alpha=0.7)
+plt.gca().xaxis.set_major_locator(mdates.YearLocator(2))  # Every 2 years
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+plt.gca().xaxis.set_minor_locator(mdates.MonthLocator(interval=3))  # Every 3 months
+plt.gcf().autofmt_xdate()
+plt.legend()
+plt.tight_layout()
+output_figure_path = os.path.join(OUTPUT_DIR, "evolution_concentration_glace_2003-2025.png")
+plt.savefig(output_figure_path, dpi=300, bbox_inches="tight")
+plt.show
