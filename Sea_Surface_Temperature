@@ -1,0 +1,286 @@
+import copernicusmarine
+import geopandas as gpd
+import rioxarray
+import xarray as xr
+import pandas as pd
+import numpy as np
+import rasterio
+from scipy import stats
+from rasterio.transform import from_origin
+from rasterio.features import rasterize
+
+# Downloads SST data from model and observations for East Antarctica
+#copernicusmarine.subset(
+#  dataset_id="cmems_mod_glo_phy_my_0.083deg_P1D-m",  # Model
+#  dataset_id="METOFFICE-GLO-SST-L4-REP-OBS-SST",  # Obs
+#  variables=["thetao"], # Model
+#  variables=["analysed_sst"],  # Obs
+#  minimum_longitude=0,
+#  maximum_longitude=180,
+#  minimum_latitude=-70,
+#  maximum_latitude=-50, 
+#  start_datetime="2011-01-01",
+#  end_datetime="2026-01-01",
+#  minimum_depth=0,
+#  maximum_depth=30,
+#  output_filename = "EAMPA_SST_2011-2025_Obs.nc",
+#  output_directory = "STAGE_Mercator.X.MHNH"
+#)
+
+# ---- Helper Functions ---
+# Calculate the area of each grid cell (in m²) accounting for latitude
+# Args: lat_grid, lon_grid: 2D arrays of latitude and longitude (in degrees)
+# Returns: 2D array of cell areas
+def calculate_cell_areas(lat_grid, lon_grid):
+    R = 6371000
+    lat_rad = np.deg2rad(lat_grid)  #Convert latitude to radians
+    # Longitude and latitude step sizes in radians
+    dlon = np.deg2rad(np.abs(lon_grid[0, 1] - lon_grid[0, 0]))
+    dlat = np.deg2rad(np.abs(lat_grid[1, 0] - lat_grid[0, 0]))
+    # Area calculation using spherical geometry
+    area = (R**2) * np.abs(np.sin(lat_rad + dlat/2) -
+                           np.sin(lat_rad - dlat/2)) * dlon
+    return area
+
+# --- Input/Output Configuration ---
+output_dir = "C:/Users/mmarage"
+domain7_shp = gpd.read_file("C:/STAGE_Mercator.X.MHNH/EAMPA_MHNH/Data_QGIS_CCAMLR/CCAMLR_MPAPD_EPSG4326.shp")
+domain7_shp = domain7_shp.to_crs("EPSG:4326")
+
+nc_file = (
+    "C:/STAGE_Mercator.X.MHNH/EAMPA_SST_2002-2010_Obs.nc", 
+    "C:/STAGE_Mercator.X.MHNH/EAMPA_SST_2011-2025_Obs.nc"
+    )
+
+# --- Load and Prepare SST Data ---
+# Open multiples files as a single dataset with chunking for memory efficiency
+ds = xr.open_mfdataset(nc_file, chunks={'time': 100}, combine='by_coords')
+
+# Rename dimensions for geospatial operations
+sst = ds.rename({"longitude": "x", "latitude": "y"})
+sst.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+sst.rio.write_crs("EPSG:4326", inplace=True)
+
+# Extract SST variable and convert from Kelvin to Celsius
+#sst = ds["thetao"]  # Model
+sst = sst["analysed_sst"]  # Observed SST
+sst = sst - 273.15  # Convert Kelvin to Celsius
+sst = sst.sel(time=slice('2011-01-01', '2025-12-31'))
+
+# ---- Save Mean SST
+# Calculate mean SST over the period
+mean_sst = sst.mean(dim='time')
+mean_sst.rio.to_raster(
+    f"{output_dir}/EAMPA_SST_mean_2011-2025_Obs.tif",
+    dtype='float32',
+    nodata=np.nan
+)
+
+# ---- Calculate Cell Areas for Weighting ---
+# Create coordinate grids for celle area calculation
+lon_grid, lat_grid = np.meshgrid(sst.x.values, sst.y.values)
+cell_areas = calculate_cell_areas(lat_grid, lon_grid)
+
+# --- Domain 7 Mask ---
+# Rasterize Domain 7 shapefile to match SST grid
+domain7_mask = rasterize(
+    [(geom, 1) for geom in domain7_shp.geometry],  # List of (geometry, value) pairs
+    out_shape=(sst.y.size, sst.x.size),  # Output shape (height, width)
+    transform=from_origin(sst.x[0], 
+                          sst.y[-1], 
+                          sst.x[1] - sst.x[0], 
+                          sst.y[1] - sst.y[0]
+    ),
+    fill=0,
+    dtype=np.uint8,
+)
+
+# --- Save Monthly SST Maps ---
+# Save each month as a separate GeoTIFF
+for time in sst.time:
+    year = pd.to_datetime(time.values).year
+    month = pd.to_datetime(time.values).month
+    sst_month = sst.sel(time=time)
+    output_path = f"EAMPA_SST_{year}_{month:02d}.tif"
+
+    sst_month.rio.to_raster(output_path)
+
+print(f"Saved SST for {year}-{month:02d} to {output_path}")
+
+# --- Save Monthly Climatology ---
+# Calculate monthly climatology (mean for each month across all years)
+sst_monthly = sst.groupby("time.month").mean(dim="time")
+sst_monthly = sst_monthly.assign_coords(month=range(1,13))  # Add month coordinate
+
+for month in range(1, 13):
+    monthly_data = sst_monthly.isel(month=month - 1)
+    monthly_data.rio.to_raster(
+        f"sst_month_{month:02d}_Obs.tif",
+        dtype='float32',
+        nodata=np.nan
+    )
+
+print("SST means as GeoTIFF saved for each month.")
+
+# --- Save Seasonal Climatology ---
+# Define summer and winter months
+summer_months = [12, 1, 2, 3]
+winter_months = [4,5,6,7,8,9,10,11]
+
+summer_data = sst.where(sst.time.dt.month.isin(summer_months), drop=True)
+winter_data = sst.where(sst.time.dt.month.isin(winter_months), drop=True)
+
+summer_climatology = summer_data.mean(dim=['time'])
+winter_climatology = winter_data.mean(dim=['time'])
+
+# --- Saving --
+summer_climatology.rio.to_raster(
+    "EAMPA_SST_antarctic_summer_climatology_Obs.tif",
+    dtype='float32',
+    nodata=np.nan
+)
+winter_climatology.rio.to_raster(
+    "EAMPA_SST_antarctic_winter_climatology_Obs.tif",
+    dtype='float32',
+    nodata=np.nan
+)
+
+print("Climatological means for winter and summer saved as GeoTIFF.")
+
+# --- Linear Trend Analysis ---
+# Add month-year coordinate for grouping
+sst = sst.assign_coords(
+    month_year=("time", [f"{t.dt.year.values}-{t.dt.month.values:02d}" for t in sst.time])
+)
+sst_means = sst.groupby("month_year").mean(dim="time")
+
+# Extract month numbers from month_year as a pandas Series
+month_numbers = pd.Series(sst_means.month_year.values).str.extract(r"-(\d+)$", expand=False).astype(int)
+
+# Convert to xarray DataArray for masking
+mask_summer = xr.DataArray(month_numbers.isin(summer_months), dims=["month_year"])
+mask_winter = xr.DataArray(month_numbers.isin(winter_months), dims=["month_year"])
+
+# Filter for summer and winter
+sst_summer = sst_means.where(mask_summer, drop=True)
+sst_winter = sst_means.where(mask_winter, drop=True)
+
+# Initialize an array to store the trend slopes for each month
+trend_slopes = np.full((12, sst.y.size, sst.x.size), np.nan)
+
+# Loop over each month (1-12)
+for month in range(1, 13):
+   # Extract data for the current month across all years
+    monthly_data = sst_means.where(
+        sst_means.month_year.str.endswith(f"-{month:02d}"), drop=True
+    )
+
+    # Reshape data for vectorised regression; with shape : (time, y, x)
+    y = monthly_data.values  # (n_time, y, x)
+    x = np.arange(y.shape[0])[:, None, None]  # (n_time, 1, 1)
+
+    # Vectorized linear regression
+    # Compute slope for all grid points at once
+    slopes = np.full((y.shape[1], y.shape[2]), np.nan)
+    for i in range(y.shape[1]):
+        for j in range(y.shape[2]):
+            y_col = y[:,i, j]
+            slope, _, _, _, _ = stats.linregress(x[:, 0, 0], y_col)
+            slopes[i, j] = slope
+    
+    # Store the trend for the actual month
+    trend_slopes[month-1, :, :] = slopes
+
+    # Weighted_trend_summer
+    slopes_filled = np.where(np.isnan(slopes), 0, slopes)
+    weighted_trend = slopes_filled * cell_areas * domain7_mask
+    total_area = (cell_areas * domain7_mask).sum()
+    surface_weighted_mean = weighted_trend.sum() / total_area
+    print(f"Month {month:02d}: Surface-weighted mean trend = {surface_weighted_mean:.4f}")
+
+    # Create a DataArray for this month's trend
+    trend_da = xr.DataArray(
+        slopes,
+        dims=("y", "x"),
+        coords={"y": sst.y, "x": sst.x},
+        name=f"trend_month_{month:02d}"
+    )
+
+    # Set CRS and export to GeoTIFF
+    trend_da.rio.write_crs("EPSG:4326", inplace=True)
+    trend_da.rio.to_raster(
+        f"trend_month_{month:02d}_Obs.tif",
+        dtype='float32',
+        nodata=np.nan  # Explicitly set NoData value
+    )
+
+# Loop for summer months
+y_summer = sst_summer.values
+x_summer = np.arange(y_summer.shape[0])[:, None, None]
+
+slopes_summer = np.full((y_summer.shape[1],
+                         y_summer.shape[2]), np.nan)
+
+for i in range (y_summer.shape[1]):
+    for j in range (y_summer.shape[2]):
+        y_col = y_summer[:, i, j]
+        if np.sum(~np.isnan(y_col)) < 2:
+            slopes_summer[i, j] = np.nan
+            continue
+        slope, _, _, _, _ = stats.linregress(x_summer[:, 0, 0], y_col)
+        slopes_summer[i, j] = slope
+
+slopes_summer_filled = np.where(np.isnan(slopes_summer), 0, slopes_summer)
+weighted_trend_summer = slopes_summer_filled * cell_areas * domain7_mask
+total_area_summer = (cell_areas * domain7_mask).sum()
+surface_weighted_mean_summer = weighted_trend_summer.sum() / total_area_summer
+print(f"Summer (Dec-Mar): Surface-weighted mean trend = {surface_weighted_mean_summer:.4f} °C per year")
+
+trend_da_summer = xr.DataArray(
+    slopes_summer,
+    dims=("y", "x"),
+    coords={"y": sst.y, "x": sst.x},
+    name="trend_summer"
+)
+trend_da_summer.rio.write_crs("EPSG:4326", inplace=True)
+trend_da_summer.rio.to_raster(
+    "trend_summer_Obs.tif",
+    dtype='float32',
+    nodata=np.nan
+)
+
+# Loop for winter months
+y_winter = sst_winter.values
+x_winter = np.arange(y_winter.shape[0])[:, None, None]
+
+slopes_winter = np.full((y_winter.shape[1],
+                         y_winter.shape[2]), np.nan)
+
+for i in range (y_winter.shape[1]):
+    for j in range (y_winter.shape[2]):
+        y_col = y_winter[:, i, j]
+        if np.sum(~np.isnan(y_col)) < 2:
+            slopes_winter[i, j] = np.nan
+            continue
+        slope, _, _, _, _ = stats.linregress(x_winter[:, 0, 0], y_col)
+        slopes_winter[i, j] = slope
+
+slopes_winter_filled = np.where(np.isnan(slopes_winter), 0, slopes_winter)
+weighted_trend_winter = slopes_winter_filled * cell_areas * domain7_mask
+total_area_winter = (cell_areas * domain7_mask).sum()
+surface_weighted_mean_winter = weighted_trend_winter.sum() / total_area_winter
+
+print(f"Winter (Apr-Nov): Surface-weighted mean trend = {surface_weighted_mean_winter:.4f} °C per year")
+trend_da_winter = xr.DataArray(
+    slopes_winter,
+    dims=("y", "x"),
+    coords={"y": sst.y, "x": sst.x},
+    name="trend_winter"
+)
+trend_da_winter.rio.write_crs("EPSG:4326", inplace=True)
+trend_da_winter.rio.to_raster(
+    "trend_winter_Obs.tif",
+    dtype='float32',
+    nodata=np.nan
+)
+print("Processing complete for Ice Concentration Trend. GeoTIFF files saved for each month.")
