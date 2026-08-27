@@ -1,0 +1,93 @@
+import os
+import numpy as np
+import geopandas as gpd
+import rasterio
+import xarray as xr
+from rasterio.features import rasterize
+from scipy.ndimage import distance_transform_edt
+
+# --- Intput/Output Configuration
+input_shp = "C:/STAGE_Mercator.X.MHNH/Quantarctica3/Quantarctica3/EAMPA_Benthic/Canyons.shp"
+output_tif = "canyon_distance_100km.tif"
+output_nc = "canyon_distance_100km.nc"
+output_dir = "C:/Users/mmarage"
+os.makedirs(output_dir, exist_ok=True)
+
+# --- Parameters ---
+target_resolution = 0.1  # Target grid resolution in degrees (0.1°)
+max_distance_km = 100  # Maximum distance to compute (in km)
+buffer_m = max_distance_km * 1000  # Convert to meters for distance calculation
+
+# -- Load and Prepare Input Data
+gdf = gpd.read_file(input_shp)
+gdf.crs = gdf.crs if gdf.crs else "EPSG:4326"
+
+# --- Create Target Grid ---
+# Calculate grid bounds and dimensions from the shapefile
+minx, miny, maxx, maxy = gdf.total_bounds
+width = int(np.ceil((maxx - minx) / target_resolution))  # Number of columns
+height = int(np.ceil((maxy - miny) / target_resolution))  # Number of rows
+# Create affine transform for the target grid
+transform = rasterio.transform.from_origin(minx, maxy, target_resolution, target_resolution)
+
+# -- Rasterize Canyon Axes --
+# Convert canyon geometries to raster format (1 = canyon, 0 = no canyon)
+shapes = [(geom, 1) for geom in gdf.geometry]
+mask = rasterize(
+    shapes,
+    out_shape=(height, width),  # Output shape (rows, columns)
+    transform=transform,  # Affine tranform for georeferencing
+    fill=0,  # Fill value for areas without canyons
+    dtype=np.uint8,  # Data type for the output array
+)
+
+# --- Compute Distance to Nearest Canyon ---
+# Inverted mask: 1 = no canyon, 0 = canyon (required for distance_tranform_edt)
+inverted_mask = 1 - mask
+# Calculate meters per degree for accurate distance computation
+avg_lat = (maxy + miny) / 2  # Average latitude for the region
+earth_radius = 6371000 
+meters_per_deg_lat = np.pi * earth_radius / 180  # Meters per degree of latitude
+meters_per_deg_lon = meters_per_deg_lat * np.cos(np.radians(avg_lat))  # Meters per degree of longitude (varies with latitude)
+sampling = (meters_per_deg_lon * target_resolution, meters_per_deg_lat * target_resolution)  # Sampling distance in meters for each pixel
+
+# Compute Euclidean distance tansform (in meters)
+dist_meters = distance_transform_edt(inverted_mask, sampling=sampling)
+dist_meters_truncated = np.minimum(dist_meters, buffer_m)  # Truncate distances at the maximum distance (100km)
+
+# ---- Saving --
+# GeoTIFF
+with rasterio.open(
+    os.path.join(output_dir, output_tif),
+    "w",
+    driver="GTiff",
+    height=height,
+    width=width,
+    count=1,
+    dtype=dist_meters_truncated.dtype,
+    crs=gdf.crs,
+    transform=transform,
+) as dst:
+    dst.write(dist_meters_truncated, 1)
+
+# NetCDF
+x_coords = np.linspace(minx, maxx, width)
+y_coords = np.linspace(miny, maxy, height)
+
+ds = xr.Dataset(
+    {
+        "distance": (["y", "x"], dist_meters_truncated),
+    },
+    coords={
+        "x": x_coords,
+        "y": y_coords,
+    },
+)
+ds.attrs["crs"] = str(gdf.crs)
+ds["distance"].attrs["units"] = "meters"
+ds["distance"].attrs["long_name"] = "Distance to nearest canyon"
+
+nc_path = os.path.join(output_dir, output_nc)
+ds.to_netcdf(nc_path)
+
+print("DONE")
