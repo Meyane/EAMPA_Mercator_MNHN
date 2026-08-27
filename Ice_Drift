@@ -1,0 +1,134 @@
+import xarray as xr
+import copernicusmarine
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Point, LineString
+import os
+
+"""
+# Downloads sea ice drift velocity data for East Antarctica
+copernicusmarine.subset(
+  dataset_id="cmems_obs-si_ant_physic_my_drift-amsr_P2D",
+  minimum_longitude=0,
+  maximum_longitude=180,
+  minimum_latitude=-70,
+  maximum_latitude=-50, 
+  start_datetime="2003-04-01",
+  end_datetime="2020-12-31",
+  minimum_depth=0,
+  maximum_depth=30,
+  output_filename = "EAMPA_IceShift_2003-2020_Obs.nc",
+  output_directory = "C:/Users/mmarage/STAGE_Mercator.X.MHNH"
+)"""
+
+# ---- Load Datasets ---
+# Load sea ice velocity data (eastward and northward components)
+file_vel = "C:/STAGE_Mercator.X.MHNH/EAMPA_IceShift_2003-2020_Obs.nc"
+ds_vel = xr.open_dataset(file_vel)
+east = ds_vel.eastward_sea_ice_velocity  # Eastward velocity components
+north = ds_vel.northward_sea_ice_velocity  # Northward velocity components
+
+# Load sea ice concentratio data
+file_sic = "C:/STAGE_Mercator.X.MHNH/EAMPA_Ice_2003-2020_Obs.nc"
+ds_sic = xr.open_dataset(file_sic)
+sic = ds_sic["ice_conc"]
+
+# --- Align and Filter Data ---
+# Interpolate sea ice concentration to match velocity grid using nearest-neighbor
+sic_aligned = sic.interp_like(east, method='nearest')
+
+# Create mask: only keep areas with >40% sea ice concentration
+mask = sic_aligned > 40
+# Apply mask to velocity components
+east_filt = east.where(mask)
+north_filt = north.where(mask)
+
+# --- Calculate Ice Drift Speed ---
+# Compute daly ice drift speed (magnitude of velocity vector)
+daily_speed = np.sqrt(east_filt**2 + north_filt**2)
+# Compute yearly mean speed (skip NaN values)
+yearly_mean_speed = daily_speed.groupby('time.year').mean(dim='time', skipna=True)
+
+# --- Focus on August (Austral Winter) ---
+# Select only August data for both velocity components
+east_aug = east_filt.sel(time=east_filt.time.dt.month == 8)
+north_aug = north_filt.sel(time=north_filt.time.dt.month == 8)
+
+# Compute August mean velocity components
+east_mean = east_aug.mean(dim='time', skipna=True)
+north_mean = north_aug.mean(dim='time', skipna=True)
+
+# Calculate mea ice speed (magnitude) and direction
+ice_speed_mean = np.sqrt(east_mean**2 + north_mean**2)
+direction_mean = np.arctan2(-east_mean, -north_mean) * (180 / np.pi)  # Calculate direction in radians, then convert to degrees
+direction_mean = (direction_mean + 180) % 360  # Convert to meteorological convention (0° = wind coming from north, 90° = from east,etc.)
+
+# --- Subsample Data for Visualization --
+# Reduce density of vectors by subsampling (every 2nd points)
+step = 2
+east_sub = east_mean[::step, ::step]  
+north_sub = north_mean[::step, ::step]
+speed_sub = ice_speed_mean[::step, ::step]
+direction_sub = direction_mean[::step, ::step]
+
+# Create coordinate grids for the subsampled data
+lons, lats = np.meshgrid(east_sub.longitude.values, east_sub.latitude.values)
+# Flatten coordinates and data for vector processing
+lons_flat = lons.flatten()
+lats_flat = lats.flatten()
+east_flat = east_sub.values.flatten()
+north_flat = north_sub.values.flatten()
+speed_flat = speed_sub.values.flatten()
+direction_flat = direction_sub.values.flatten()
+
+# --- Filter Valid Data ---
+# Create mask for valid (non-NaN) velocity components
+valid_mask = ~np.isnan(east_flat) & ~np.isnan(north_flat)
+lons_valid = lons_flat[valid_mask]
+lats_valid = lats_flat[valid_mask]
+u_valid = east_flat[valid_mask]
+v_valid = north_flat[valid_mask]
+speed_valid = speed_flat[valid_mask]
+direction_valid = direction_flat[valid_mask]
+
+# --- Add Jitter to Avoid Overplotting ---
+# Set random seed for reproductibility
+np.random.seed(42) 
+# Add small random offsets to arrow positions to improve visualization
+jitter_scale = 0.2  # Controls the magnitude of position jitter
+lons_jittered = lons_valid + np.random.normal(0, jitter_scale, len(lons_valid))
+lats_jittered = lats_valid + np.random.normal(0, jitter_scale, len(lats_valid))
+
+# --- Create Arrow Geometry for Ice Motion ---
+scale_factor = 1.5
+arrows = [
+    LineString([(x0, y0), (x0 + u * scale_factor, y0 + v * scale_factor)])
+    for x0, y0, u, v in zip(lons_jittered, lats_jittered, u_valid, v_valid)
+]
+
+# --- Create GeoDataFrame for Export ---
+arrow_gdf = gpd.GeoDataFrame(
+    {
+        "east": u_valid,
+        "north": v_valid,
+        "ice_speed": speed_valid,
+        "ice_direction": direction_valid,
+    },
+    geometry=arrows,
+    crs="EPSG:4326"  # WGS84
+)
+
+# --- Save Results ---
+output_dir = "C:/Users/mmarage"
+os.makedirs(output_dir, exist_ok=True)
+
+yearly_mean_speed = np.sqrt(east_filt**2 + north_filt**2).groupby('time.year').mean(dim='time', skipna=True)
+yearly_mean_speed.rio.write_crs("EPSG:4326", inplace=True)
+output_nc = os.path.join(output_dir, "Yearly_Mean_Ice_Speed.nc")
+yearly_mean_speed.to_netcdf(output_nc)
+
+output_shp = os.path.join(output_dir, "August_mean_Ice_Motion.shp")
+arrow_gdf.to_file(output_shp)
+
+print(f"Saved yearly mean: {output_nc}")
+print(f"Saved ice motion vectors: {output_shp}")
