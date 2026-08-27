@@ -1,0 +1,318 @@
+import os
+import pandas as pd
+import xarray as xr
+import numpy as np
+import glob
+import geopandas as gpd
+import rasterio
+import matplotlib.pyplot as plt
+from rasterio.features import rasterize
+from scipy.interpolate import griddata
+from scipy.ndimage import binary_dilation
+from skimage.measure import label, find_contours
+from shapely.geometry import LineString
+
+# --- Helper Function ---
+# Extract year and month from filename 
+def extract_data_from_filename(file):
+    basename = os.path.basename(file)
+    parts = basename.split("_")
+    year = parts[-2]  # Second-to-last part is year
+    month = parts[-1].split(".")[0]  # Last part is month (just before the file extension)
+    return f"{year}-{month}"
+
+# Load a NetCDF file and standardize its coordinates
+def load_and_fix_coords(file):
+    ds = xr.open_dataset(file)
+
+    # If x or y are 2-D, extract 1-D coordinates
+    if 'x' in ds and ds.x.ndim == 2:
+        x_coords = ds.x.isel(y=0)
+        ds = ds.drop_vars('x').assign_coords(x=x_coords)
+    if 'y' in ds and ds.y.ndim == 2:
+        y_coords = ds.y.isel(x=0)
+        ds = ds.drop_vars('y').assign_coords(y=y_coords)
+
+    # Sort coordinates for consistency
+    ds = ds.sortby('x').sortby('y')
+
+    # Extract date from filename and add as time coordinate
+    date_str = extract_data_from_filename(file)
+    if 'time' in ds.dims:
+        ds = ds.isel(time=0).drop_vars('time')  # Remove existing time dimension
+    ds = ds.assign_coords(time=[np.datetime64(f"{date_str}-01")])  # Add new time coordinate
+    return ds
+
+# Rasterize a land mask to match the target grid
+# Args: shapefile_path: Path to the land shapefile; target_lon: Target longitude coordinates; target_lat: Target latitude coordinates
+# Returns : land_mask: 2D numpy array (1 = land, 0 = ocean)
+def create_land_mask(shapefile_path, target_lon, target_lat):
+    """Rasterize a land mask to match the target grid."""
+    gdf = gpd.read_file(shapefile_path)
+    gdf = gdf.to_crs("EPSG:4326")  # Ensure WGS84
+
+    # Create a transform for the target grid
+    transform = rasterio.transform.from_bounds(
+        target_lon.min(), target_lat.min(),  # Lower-left corner
+        target_lon.max(), target_lat.max(),  # Upper-right corner
+        len(target_lon), len(target_lat)  # Width, height
+    )
+
+    # Rasterize the land mask (1 = land, 0 = ocean)
+    land_mask = rasterize(
+        [(geom, 1) for geom in gdf.geometry],  # List of (geometry, value) pairs
+        out_shape=(len(target_lat), len(target_lon)),  # Output shape (height, width)
+        transform=transform,  # Affine transform for georeferencing
+        fill=0,  # Fill value for areas without land
+        dtype=np.uint8  #Data type for the output array
+    )
+    return land_mask
+
+# Detect coastal polynyas based on sea ice concentration threshold
+# Args: ds: xarray Dataset containing ice concentration data; land_mask: Land mask (1 = land, 0 = ocean); threshold: Ice concentration threshold for polynya detection (default: 85%); variable: Variable name to use for detection (default: "ice_conc")
+# Returns : coastal_polynya_mask: 2D numpy array (1 = polynya, 0 = no polynya)
+def detect_polynyas(ds, land_mask, threshold=85, variable="ice_conc"):
+    data = ds[variable].fillna(0)  # Fill NaN with 0 (open water)
+    if variable == "ice_conc":
+        polynya_mask = (data < threshold)  # Polynya: SIC < threshold
+    else:
+        raise ValueError("Variable must be 'ice_conc' or 'ice_thickness'.")
+
+    # High ice concentration mask (surrounding ice)
+    high_ice_mask = (data >= threshold)
+
+    # Dilate land mask to account for coastal proximity
+    land_mask_dilated = binary_dilation(land_mask,iterations=10)
+
+    # A polynya is valid if:
+    # 1. It meets the threshold (low SIC)
+    # 2. It is adjacent to land or high SIC (coastal)
+    coastal_polynya_mask = polynya_mask & (high_ice_mask | (land_mask == 1) | (land_mask_dilated == 1))
+
+    return coastal_polynya_mask.astype(float)
+
+# --- Load Data ---
+# Get list of NetCDF files and load each one 
+files = glob.glob("C:/STAGE_Mercator.X.MHNH/Data/Mean_Trend_Ice_2003-2026/*.nc") 
+datasets = [load_and_fix_coords(file) for file in files]
+
+# --- Define Reference Grid ---
+# Use 2004 AMSR data as reference for grid alignement
+reference_ds = None
+for ds in datasets:
+    year = int(str(ds.time.values[0])[:4])  #Extract year from time coordinate
+    if 2004 <= year <= 2020:
+        reference_ds = ds
+        break
+if reference_ds is None:
+    raise ValueError("No dataset found.")
+
+# EXtract reference grid coordinates
+target_lon = reference_ds.x.values
+target_lat = reference_ds.y.values
+target_lon_grid, target_lat_grid = np.meshgrid(target_lon, target_lat)
+
+# -- Create Land Mask --
+# Load and rasterize land mask for the region
+land_mask = create_land_mask("C:/STAGE_Mercator.X.MHNH/EAMPA_MHNH/Data_QGIS_CCAMLR/CCAMLR_MPAPD_EPSG4326.shp", target_lon, target_lat)
+
+# --- Polynya Detection Loop ---
+# Initialize lists to store results 
+polynya_masks = []  # Store binary polynya masks for each time step
+time_coords = []  # Store time coordinates
+polynya_areas = []  # Total polynya area (grid cells) per time step
+polynya_counts = []  # Number of individual polynyas per time step
+
+for ds in datasets:
+    year = int(str(ds.time.values[0])[:4])  #Extract year from time coordinate
+
+    # Extract data and coordinates
+    data = ds["ice_conc"].values
+    x = ds.x.values
+    y = ds.y.values
+    
+    # Check if data is transposed (shape mismatch)
+    if data.shape == (len(x), len(y)):
+        data = data.T  #Transpose to match (y, x) shape
+    
+    # Check if data has extra rows/columns and slice to match coordinate dimensions
+    if data.shape[0] > len(y):
+        data = data[:len(y), :]  # Slice to match y dimension
+    if data.shape[1] > len(x):
+        data = data[:, :len(x)]  #Slice to match x dimension
+
+    # Create coordinate grids for the current dataset
+    x_grid, y_grid = np.meshgrid(x, y)
+
+    if 2020 <= year <= 2026:
+        # Flatten grids for interpolation
+        points = np.column_stack((x_grid.ravel(), y_grid.ravel()))
+        values = data.ravel()
+
+        # Filter out NaN values
+        valid_mask = ~np.isnan(values) & ~np.isnan(points[:, 0]) & ~np.isnan(points[:, 1])
+        points = points[valid_mask]
+        values = values[valid_mask]
+
+        # Interpolate to target grid using nearest-neighbor
+        regridded_data = griddata(
+            points, values, (target_lon_grid.ravel(), target_lat_grid.ravel()), method='nearest')
+        regridded_data = regridded_data.reshape(target_lon_grid.shape)
+
+        # Create new dataset with regridded data
+        ds_regridded = xr.Dataset({
+            "ice_conc": (["y", "x"], regridded_data),
+        }, coords={"y": target_lat, "x": target_lon})
+    else:
+        # Use original dataset for other years
+        ds_regridded = ds
+
+    # Ensure time coordinate is preserved
+    ds_regridded = ds_regridded.assign_coords(time=[ds.time.values[0]])
+
+    # Detect polynyas in the current dataset
+    polynya_mask = detect_polynyas(
+        ds_regridded,
+        land_mask,
+        threshold=85,
+        variable="ice_conc"
+    )
+
+    # Label individual polynyas (connected components)
+    labeled_polynyas = label(polynya_mask.values, connectivity=2)  # 8-connectivity
+    num_polynyas = np.max(labeled_polynyas)  # Count of unique polynyas (0 = background)
+
+    # Store results
+    polynya_masks.append(polynya_mask.values[None, :, :])
+    time_coords.append (ds_regridded.time.values[0])
+    polynya_areas.append(polynya_mask.sum().values)  # Total area (grid cells)
+    polynya_counts.append(num_polynyas)
+
+# --- Conbine Results ---
+if polynya_masks:
+    # Stack all polynya masks into a single array
+    polynya_masks = np.concatenate(polynya_masks, axis=0)
+    time_coords = np.array(time_coords)
+    polynya_areas = np.array(polynya_areas)
+    polynya_counts = np.array(polynya_counts)
+
+    # Create xarray Dataset with all results
+    polynya_ds = xr.Dataset({
+        "polynya_mask": (["time", "y", "x"], polynya_masks),  # Binary polynya masks
+        "polynya_area": (["time"], polynya_areas),  # Total polynya area per time step
+        "polynya_count": (["time"], polynya_counts),  # Number of polynyas per time step
+    }, coords={"time": time_coords, "y": target_lat, "x": target_lon})
+
+    # Calculate polynya frequency (fraction of time each pixel is a polynya)
+    polynya_frequency = polynya_ds["polynya_mask"].groupby("time.year").mean(dim="time")
+
+    # --- Save Anuual Polynya Frequency Maps ---
+    output_dir = "C:/Users/mmarage"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for year in polynya_frequency.year.values:
+        freq_da = polynya_frequency.sel(year=year)
+        # Set spatial dimensions for geospatial operations 
+        freq_da.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+        freq_da.rio.write_crs("EPSG:4326", inplace=True)
+        freq_da.rio.to_raster(
+            os.path.join(output_dir, f"polynya_frequency_{year}.tif"),
+            dtype='float32',
+            nodata=np.nan
+        )
+
+    print("Processing complete. Polynya masks, frequency, and metrics saved.")
+
+# --- Calculate and Save Period Means ---
+# Calculate mean polynya frequency for 2003-2010 and 2011-2025
+polynya_frequency_2003_2010 = polynya_frequency.sel(year=slice(2003, 2010)).mean(dim="year")
+polynya_frequency_2011_2025 = polynya_frequency.sel(year=slice(2011, 2025)).mean(dim="year")
+
+# Set spatial dimensions and CRS for output
+for freq_da in [polynya_frequency_2003_2010, polynya_frequency_2011_2025]:
+    freq_da.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+    freq_da.rio.write_crs("EPSG:4326", inplace=True)
+
+# Save the aggregated .tif files
+output_dir = "C:/Users/mmarage"
+os.makedirs(output_dir, exist_ok=True)
+
+polynya_frequency_2003_2010.rio.to_raster(
+    os.path.join(output_dir, "polynya_frequency_2003-2010.tif"),
+    dtype='float32',
+    nodata=np.nan
+)
+
+polynya_frequency_2011_2025.rio.to_raster(
+    os.path.join(output_dir, "polynya_frequency_2011-2025.tif"),
+    dtype='float32',
+    nodata=np.nan
+)
+
+print("Aggregated .tif files for 2003-2010 and 2011-2025 saved.")
+
+# --- Generate Polynya Contours for 2003-2010 ---
+all_contours = []
+contour_lines = []
+
+# Define transform for coordinate conversion
+transform = rasterio.transform.from_bounds(
+    target_lon.min(), target_lat.min(),
+    target_lon.max(), target_lat.max(),
+    len(target_lon), len(target_lat)
+)
+
+# Process only 2003-2010 data for contour generation
+for ds in datasets:
+    year = int(str(ds.time.values[0])[:4])
+    if not (2003 <= year <= 2010):
+        continue
+
+    # Reuse data preparation logic
+    data = ds["ice_conc"].values
+    x, y = ds.x.values, ds.y.values
+
+    # Handle shape mismatches
+    if data.shape == (len(x), len(y)): data = data.T
+    if data.shape[0] > len(y): data = data[:len(y), :]
+    if data.shape[1] > len(x): data = data[:, :len(x)]
+
+    x_grid, y_grid = np.meshgrid(x, y)
+    if 2020 <= year <= 2026:
+        points = np.column_stack((x_grid.ravel(), y_grid.ravel()))
+        values = data.ravel()
+        valid_mask = ~np.isnan(values) & ~np.isnan(points[:, 0]) & ~np.isnan(points[:, 1])
+        regridded_data = griddata(
+            points[valid_mask], values[valid_mask],
+            (target_lon_grid.ravel(), target_lat_grid.ravel()), method='nearest'
+        ).reshape(target_lon_grid.shape)
+        ds_regridded = xr.Dataset({"ice_conc": (["y", "x"], regridded_data)},
+                                  coords={"y": target_lat, "x": target_lon})
+    else:
+        ds_regridded = ds
+    ds_regridded = ds_regridded.assign_coords(time=[ds.time.values[0]])
+
+    # Get polynya mask and find contour lines where value == 1
+    polynya_mask = detect_polynyas(ds_regridded, land_mask, threshold=85, variable="ice_conc").values
+    contours = find_contours(polynya_mask, level=0.5)  # 0.5 for binary mask (1 vs 0)
+
+    # Convert contours to LineStrings
+    for contour in contours:
+        xs, ys = rasterio.transform.xy(transform, contour[:, 0], contour[:, 1])
+        line = LineString(zip(xs, ys))
+        contour_lines.append({
+            'geometry': line,
+            'time': ds_regridded.time.values[0],
+            'year': year
+        })
+
+# Save as a single .shp file
+if contour_lines:
+    output_dir = "C:/Users/mmarage"
+    os.makedirs(output_dir, exist_ok=True)
+    gdf = gpd.GeoDataFrame(contour_lines, crs="EPSG:4326")
+    output_shp = os.path.join(output_dir, "polynya_contour_lines_2003-2010.shp")
+    gdf.to_file(output_shp)
+    print(f"✅ Saved {len(gdf)} contour lines to {output_shp}")
+else:
+    print("❌ No contours found for 2003-2010.")
