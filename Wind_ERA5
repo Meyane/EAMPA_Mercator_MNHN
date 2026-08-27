@@ -1,0 +1,104 @@
+import xarray as xr
+import cftime
+import numpy as np
+import geopandas as gpd
+import os
+from shapely.geometry import LineString
+
+# ---- Load Dataset ---
+file = "C:/STAGE_Mercator.X.MHNH/ERA5_Monthly_U10V10W10_2000-2026.nc"
+ds = xr.open_dataset(file, decode_times=False)  # Disable auto time decoding
+
+# --- Decode Time Coordinates ---
+# EXtract time values and decode using cftime (handles non-standard calendars)
+time_values = ds["valid_time"].values
+time_units = ds["valid_time"].attrs["units"]
+calendar = ds["valid_time"].attrs.get("calendar", "360_day")
+ds["valid_time"] = cftime.num2date(time_values, units=time_units, calendar=calendar)
+
+# --- Extract Wind Components ----
+u10 = ds["u10"]  # Eastward wind component at 10m height
+v10 = ds["v10"]  # Northward wind component at 10m height
+
+# ---- Calculate Annual Means ----
+# Group by year and calculate mean wind components for each year
+annual_mean_u10 = u10.groupby("valid_time.year").mean(dim="valid_time")
+annual_mean_v10 = v10.groupby("valid_time.year").mean(dim="valid_time")
+
+# --- Calculate Long-Term Means ---
+# Calculate the overall mean wind components across all years
+long_term_mean_u10 = annual_mean_u10.mean(dim="year")
+long_term_mean_v10 = annual_mean_v10.mean(dim="year")
+
+# --- Calculate Wind Speed and Direction ---
+# Compute wind speed (magnitude of the wind vector)
+wind_speed = np.sqrt(long_term_mean_u10**2 + long_term_mean_v10**2)
+
+# Calculate wind direction (meteorological convention: 0° = wind from north, 90° = wind from east)
+wind_direction = np.arctan2(-long_term_mean_u10, -long_term_mean_v10) * (180 / np.pi)  # Calcuate in radians, then convert to degrees
+wind_direction = (wind_direction + 180) % 360  # Adjust to meteorological convention
+
+# --- Subsample for Visualization --- 
+# Reduce density of vectors by subsampling (every 4th point)
+step = 4
+# Subsample wind components and derived quantities
+u_sub = long_term_mean_u10.values[::step, ::step].flatten()
+v_sub = long_term_mean_v10.values[::step, ::step].flatten()
+speed_sub = wind_speed.values[::step, ::step].flatten()
+direction_sub = wind_direction.values[::step, ::step].flatten()
+
+# Create subsampled coordinate grids
+lons_sub = long_term_mean_u10.longitude.values[::step]
+lats_sub = long_term_mean_u10.latitude.values[::step]
+lons_grid, lats_grid = np.meshgrid(lons_sub, lats_sub)
+# Flatten coordinates to match subsampled wind data
+lons_flat = lons_grid.flatten()
+lats_flat = lats_grid.flatten()
+
+# ---- Add Jitter to Avoid Overplotting ----
+# Set random seed for reproducibility
+np.random.seed(42)
+# Add small random offsets to arrow positions to improve visualization
+jitter_scale = 0.2  # Controls the magnitude of position jitter
+lons_jittered = lons_flat + np.random.normal(0, jitter_scale, len(lons_flat))
+lats_jittered = lats_flat + np.random.normal(0, jitter_scale, len(lats_flat))
+
+# --- Normalize Wind Vectors for Fixed-Length Arrows ---
+magnitudes = np.sqrt(u_sub**2 + v_sub**2)
+# Initialize normalized vectors
+u_normalized = np.zeros_like(u_sub)
+v_normalized = np.zeros_like(v_sub)
+# Normalize non-zero vectors (preserve direction, set magniude to 1)
+non_zero_mask = magnitudes > 0
+u_normalized[non_zero_mask] = u_sub[non_zero_mask] / magnitudes[non_zero_mask]
+v_normalized[non_zero_mask] = v_sub[non_zero_mask] / magnitudes[non_zero_mask]
+
+# --- Create Arrow Geometries ---
+# Use fixed length for all arrows (for consistent visualization)
+fixed_length = 0.5
+# Create LineString arrows 
+arrows = [
+    LineString([
+        (x0, y0),
+        (x0 + u * fixed_length, y0 + v * fixed_length)
+    ])
+    for x0, y0, u, v in zip(lons_jittered, lats_jittered, u_sub, v_sub)
+]
+
+# --- Create GeoDataFrame for Export ---
+arrow_gdf = gpd.GeoDataFrame(
+    {
+        "u10": u_sub,
+        "v10": v_sub,
+        "wind_speed": speed_sub,
+        "wind_direction": direction_sub,
+    },
+    geometry=arrows,
+    crs="EPSG:4326"  # WGS84
+)
+
+# Save as a new shapefile
+output_dir = "C:/Users/mmarage"
+output_shp = os.path.join(output_dir, "Wind_Vectors_Arrows.shp")
+arrow_gdf.to_file(output_shp)
+print(f"Saved wind vector arrows as shapefile: {output_shp}")
