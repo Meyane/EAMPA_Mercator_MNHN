@@ -1,0 +1,69 @@
+import copernicusmarine
+import xarray as xr
+import rioxarray as rxr
+
+"""
+# Download picoplankton (PICO) obsevrations for East Antarctica
+copernicusmarine.subset(
+  dataset_id="cmems_obs-oc_glo_bgc-plankton_my_l4-multi-4km_P1M",  # Plankton, multi-sensor (4 km), monthly  
+  variables=["PICO"],
+  minimum_longitude=0,
+  maximum_longitude=180,
+  minimum_latitude=-70,
+  maximum_latitude=-50, 
+  start_datetime="2003-01-01",
+  end_datetime="2025-12-31",
+  minimum_depth=0,
+  maximum_depth=1000,
+  output_filename = "EAMPA_PICOP_2003-2025_Obs.nc",
+  output_directory = "C:/Users/mmarage/STAGE_Mercator.X.MHNH"
+)"""
+
+# --- Input/Output Configuration ---
+file = "C:/STAGE_Mercator.X.MHNH/EAMPA_PicoP_2003-2025_Obs.nc"
+output_dir = "C:/Users/mmarage"
+
+# --- Load Data ----
+ds = xr.open_dataset(file)
+plankton = ds["PICO"]  # Extract picoplankton variable 
+
+# -- Add time Coordinates (if missing) ---
+# Add 'month' and 'year' coordinates for easier time-based selection 
+if 'month' not in plankton.coords:
+    plankton = plankton.assign_coords(month=plankton.time.dt.month)
+if 'year' not in plankton.coords:
+    plankton = plankton.assign_coords(year=plankton.time.dt.year)
+plankton = plankton.rio.write_crs("WGS84", inplace=True)
+
+# -- Process Annual Means ---
+# Loop through years 2003-2025 and compute mean picoplankton concnetration for each year
+for year in range(2003, 2026):
+    periodP = plankton.sel(time=(  # Select data for the current year
+        (plankton.time.dt.year == year)
+    ))
+
+    # Only process if data exists for this year 
+    if len(periodP.time) > 0:  # Only process if data exists
+        mean_periodP = periodP.mean(dim='time')
+        mean_periodP.rio.to_raster(f"{output_dir}/{year}_Picoplankton_mean.tif")
+    else:
+        print(f"No data found for year {year}")
+
+# --- Process Multi-Year Periods ---
+# 2003-2010 period
+period1 = plankton.sel(time=(
+    (plankton.time.dt.year >= 2003) &
+    (plankton.time.dt.year <= 2010)
+))
+mean_period1 = period1.mean(dim='time')
+mean_period1.rio.to_raster(f"{output_dir}/2003-2010_Picoplankton_mean.tif")
+
+# 2011-2025 period
+period2 = plankton.sel(time=(
+    (plankton.time.dt.year >= 2011) &
+    (plankton.time.dt.year <= 2025)
+))
+mean_period2 = period2.mean(dim='time')
+mean_period2.rio.to_raster(f"{output_dir}/2011-2025_Picoplankton_mean.tif")
+
+print("Processing complete! GeoTIFF files saved.")
