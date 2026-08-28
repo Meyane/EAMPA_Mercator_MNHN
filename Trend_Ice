@@ -1,0 +1,294 @@
+import os
+import xarray as xr
+import glob
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from shapely.geometry import box
+from scipy import stats
+from scipy.interpolate import griddata
+from rasterio.features import rasterize
+
+# --- Helper Functions ---
+# Extract date from filename 
+def extract_date_from_filename(file):
+    basename = os.path.basename(file)
+    parts = basename.split("_")
+    year = parts[-2]
+    month = parts[-1].split(".")[0]
+    return f"{year}-{month}"
+
+# Load and fix coordinates
+# Args: file: Path to the NetCDF file
+# Returns: ds: xarray Dataset with standardized coordinates
+def load_and_fix_coords(file):
+    ds = xr.open_dataset(file)
+    # If x or y are 2-D, extract 1-D coordinates
+    if 'x' in ds and ds.x.ndim == 2:
+        x_coords = ds.x.isel(y=0)
+        ds = ds.drop_vars('x').assign_coords(x=x_coords)
+    if 'y' in ds and ds.y.ndim == 2:
+        y_coords = ds.y.isel(x=0)
+        ds = ds.drop_vars('y').assign_coords(y=y_coords)
+    ds = ds.sortby('x').sortby('y')  # Sort coordinates for consistency
+
+    # Extract date from filenam and add as time coordinate
+    date_str = extract_date_from_filename(file)
+    if 'time' in ds.dims:
+        ds = ds.isel(time=0).drop_vars('time')  # Remove existing time dimension
+    ds = ds.assign_coords(time=[np.datetime64(f"{date_str}-01")])  # Add new time coordinate
+    return ds
+
+# Calculate celle areas for each grid cell (m²)
+# Args: lat_grid, lon_grid: 2D arrays of latitude and longitude (in degrees)
+# Returns: 2D array of cell areas (in square meters)
+def calculate_cell_areas(lat_grid, lon_grid):
+    R = 6371000
+    lat_rad = np.deg2rad(lat_grid)  # Convert latitude to radians
+    # Longitude and latitude step sizes in radians
+    dlon = np.deg2rad(np.abs(lon_grid[0, 1] - lon_grid[0, 0]))
+    dlat = np.deg2rad(np.abs(lat_grid[1, 0] - lat_grid[0, 0]))
+    # Area calculation using spherical geometry
+    area = (R**2) * np.abs(np.sin(lat_rad + dlat/2) -
+                           np.sin(lat_rad - dlat/2)) * dlon
+    return area
+
+# Convert p-values to GeoDataFrame
+# Args: pvalues: 2D array of p-values; x: 1D array of longitude coordinates; y: 1D array of latitude coordinates; threshold: Significance threshold (default: 0.05)
+# Returns: gdf: GeoDataFrame with polygon geometries for significant pixels
+def pvalues_to_gdf(pvalues, x, y, threshold=0.05):
+    significant = pvalues <= threshold  # Boolean mask for significant p-values
+    polygons = []
+    for i in range(significant.shape[0]):
+        for j in range(significant.shape[1]):
+            if significant[i, j]:
+                # Create a small polygon for each significant pixel
+                # Calculate bounds for the current pixel
+                x0, x1 = x[j], x[j+1] if j < len(x)-1 else x[j] + (x[j] - x[j-1])
+                y0, y1 = y[i], y[i+1] if i < len(y)-1 else y[i] + (y[i] - y[i-1])
+                polygons.append(box(x0, y0, x1, y1))  # Create bounding box poygon
+    gdf = gpd.GeoDataFrame(geometry=polygons, crs="EPSG:4326")
+    return gdf
+
+# --- Input/Output Configuration ---
+output_dir = "C:/Users/mmarage"
+domain7_shp = gpd.read_file("C:/STAGE_Mercator.X.MHNH/EAMPA_MHNH/Data_QGIS_CCAMLR/CCAMLR_MPAPD_EPSG4326.shp")
+domain7_shp = domain7_shp.to_crs("EPSG:4326")
+
+# ---- Load and Process Data ---
+files = glob.glob("C:/STAGE_Mercator.X.MHNH/Data/Mean_Trend_Ice_2003-2026/*.nc") 
+datasets = [load_and_fix_coords(file) for file in files]
+
+# --- Create Target Grid --- 
+# Define spatial bounds for the target grid
+lon_min = 0
+lon_max = 180
+lat_min = -70
+lat_max = -50
+
+# Create a regular target grid
+num_points = 1500  # Number of points in each dimension
+target_lon = np.linspace(lon_min, lon_max, num_points)
+target_lat = np.linspace(lat_min, lat_max, num_points)
+target_lon_grid, target_lat_grid = np.meshgrid(target_lon, target_lat)  #2D coordinate grids
+
+# ---- Create Domain 7 mask ---
+# Rasterize Domain 7 shapefile to match the target grid
+domain7_mask = rasterize(
+    [(geom, 1) for geom in domain7_shp.geometry],  # List of (geometry, value) pairs
+    out_shape=(target_lat.size, target_lon.size),  # Output shape (height, width)
+    transform=rasterio.transform.from_bounds(
+        lon_min, lat_min, lon_max, lat_max, target_lon.size, target_lat.size),
+    fill=0,  # Fill value for areas outside Domain 7
+    dtype=np.uint8,  # Data type for the output array
+)
+
+# --- Regrid All Datasets ---
+# Initialize list for regridded datasets
+regridded_datasets = []
+for idx, ds in enumerate(datasets):
+    # Skip datasets without ice-conc variable
+    if "ice_conc" not in ds:
+        print(f"Skipping dataset {idx} without 'ice_conc' variable.")
+        continue
+
+    # EXtract data and coordinates
+    data = ds["ice_conc"].values
+    x = ds.x.values
+    y = ds.y.values
+    # Skip id data is not 2D
+    if data.ndim != 2:
+        print(f"Skipping dataset with non-2D data shape: {data.shape}")
+        continue
+    
+    # Check if data is transposed (shape mismatch)
+    if data.shape == (len(x), len(y)):
+        data = data.T
+    
+    # Check if data has extra rows/columns and slice to match coordinate dimensions
+    if data.shape[0] > len(y):
+        data = data[:len(y), :]  # Slice to match len(y)
+    if data.shape[1] > len(x):
+        data = data[:, :len(x)]  #Slice to match len(x)
+
+    # Create coordinate grids for the current dataset
+    x_grid, y_grid = np.meshgrid(x, y)
+
+    # Flatten grids for interpolation 
+    points = np.column_stack((x_grid.ravel(), y_grid.ravel()))
+    values = data.ravel()
+
+    # Mask invalid values (NaN in coordinates or data)
+    valid_mask = ~np.isnan(values) & ~np.isnan(points[:, 0]) & ~np.isnan(points[:, 1])
+    points = points[valid_mask]
+    values = values[valid_mask]
+
+    # Skip if no valid points remain
+    if len(values) == 0:
+        print("No valid points for interpolation, skipping dataset.")
+        continue
+
+    # Interpolate to the target grid using nearest-neighbor
+    regridded_data = griddata(
+        points, values, (target_lon_grid.ravel(), target_lat_grid.ravel()), method='nearest')
+    regridded_data = regridded_data.reshape(target_lon_grid.shape)
+
+    # Extract year-month from the dataset
+    year_month = ds.time.dt.strftime("%Y-%m").values[0]
+
+    # Create a new xarray DataArray for the regridded data
+    regridded_da = xr.DataArray(
+        regridded_data[None, :, :],
+        dims=("time", "y", "x"),
+        coords={
+            "time": [np.datetime64(f"{year_month}-01")],
+            "y": target_lat,
+            "x": target_lon,
+        },
+        name="ice_conc",
+    )
+
+    # Create a new Dataset and add to the list
+    regridded_ds = xr.Dataset({"ice_conc": regridded_da})
+    regridded_datasets.append(regridded_ds)
+
+# --- Combine Regridded Datasets ---
+if regridded_datasets:
+    siconc_all = xr.combine_by_coords(regridded_datasets, combine_attrs='drop_conflicts')  # Combien datasets by coordinates
+    siconc = siconc_all["ice_conc"]
+    siconc.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)  # Set spatial dimensions for the geospatial operations
+    siconc.rio.write_crs("EPSG:4326", inplace=True)
+else:
+    raise ValueError("No valid datasets were regridded.")
+
+# --- Apply Ice Concentration Mask ---
+# Only keep pixels that had ice concentration >= 0.01 at least once
+max_ice_conc = siconc.max(dim="time")
+ice_conc_mask = (max_ice_conc >= 0.01).values.astype(np.uint8)
+domain7_mask = domain7_mask * ice_conc_mask  # Combine with Domain 7 mask
+
+# ---- Linear trend analysis ---
+# Add month-year coordinate for grouping
+siconc = siconc.assign_coords(
+    month_year=("time", [f"{t.year}-{t.month:02d}" for t in siconc.time.to_index()])
+)
+siconc_means = siconc.groupby("month_year").mean(dim="time")  # Calculate monthly means across years
+
+# Initialize arrays for trend analysis
+trend_slopes = np.full((12, target_lat.size, target_lon.size), np.nan)
+trend_pvalues = np.full((12, target_lat.size, target_lon.size), np.nan)
+cumulative_trends = np.full((12, target_lat.size, target_lon.size), np.nan)
+
+# --- Calculate Monthly Trends ---
+# Loop over each month (1-12) to calculate linear trends
+for month in range(1, 13):
+   # Extract data for the current month across all years
+    monthly_data = siconc_means.where(
+        siconc_means.month_year.str.endswith(f"-{month:02d}"), drop=True
+    )
+
+    # Reshape data for linear regression : shape (time, y, x)
+    y_values = monthly_data.values  # (n_time, y, x)
+    x_values = np.arange(y_values.shape[0])[:, None, None]  # Time indices (n_time, 1, 1)
+
+    # Initialize slopes and p-values array for current month
+    slopes = np.full((y_values.shape[1], y_values.shape[2]), np.nan)
+    pvalues = np.full((y_values.shape[1], y_values.shape[2]), np.nan)
+
+    # Perform linear regression for each grid point
+    for i in range(y_values.shape[1]):
+        for j in range(y_values.shape[2]):
+            y_col = y_values[:, i, j]  # Time series for current grid point
+            # Skip if not enough valid data points
+            if np.sum(~np.isnan(y_col)) < 2:
+                slopes[i, j] = np.nan
+                pvalues[i, j] = np.nan
+                continue
+            # Calculate linear regression slope
+            slope, _, _, _, _ = stats.linregress(x_values[:, 0, 0], y_col)
+            slopes[i, j] = slope
+            pvalues[i, j] = pvalues
+
+    # Calculate cumulative trend over 14 years (2011-2025)
+    cumulative_trend = slopes * 14
+
+    # Store the trend for the actual month
+    trend_slopes[month-1, :, :] = slopes
+    trend_pvalues[month-1, :, :] = pvalues
+
+    # Create a DataArray for this month's trend
+    trend_da = xr.DataArray(
+        slopes,
+        coords={
+            "y": target_lat,
+            "x": target_lon,
+        },
+        name=f"trend_month_{month:02d}"
+    )
+    trend_da_cum = xr.DataArray(
+            cumulative_trend,
+            dims=("y", "x"),
+            coords={
+                "y": target_lat,
+                "x": target_lon,
+            },
+            name=f"cumulative_trend_month_{month:02d}"
+        )
+
+    # Calculate the Surface-Weighted Mean Trend
+    cell_areas = calculate_cell_areas(target_lat_grid, target_lon_grid)
+    weighted_trend = slopes * cell_areas * domain7_mask
+    total_area = (cell_areas * domain7_mask).sum()
+    surface_weighted_mean = weighted_trend.sum() / total_area
+
+    print(f"Month {month:02d}: Surface-weighted mean trend = {surface_weighted_mean:.4f}")
+
+    # Convert p-values to GeoDataFrame and save as shapefile
+    significant_gdf = pvalues_to_gdf(pvalues, target_lon, target_lat)
+    significant_gdf.to_file(f"significant_pvalues_month_{month:02d}.shp")
+    print(f"Saved significant p-values for month {month:02d} as shapefile.")
+
+    # Set CRS and export to GeoTIFF
+    trend_da = trend_da.sortby("x").sortby("y")
+    trend_da.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+    trend_da.rio.write_crs("EPSG:4326", inplace=True)
+    trend_da.rio.write_transform(inplace=True)
+
+    trend_da_cum = trend_da.sortby("x").sortby("y")
+    trend_da_cum.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+    trend_da_cum.rio.write_crs("EPSG:4326", inplace=True)
+    trend_da_cum.rio.write_transform(inplace=True)
+    
+
+    trend_da.rio.to_raster(
+        f"trend_month_{month:02d}_Obs.tif",
+        dtype='float32',
+        nodata=np.nan  # Explicitly set NoData value
+    )
+    trend_da_cum.rio.to_raster(
+            f"{output_dir}/cumulative_trend_month_{month:02d}_2011_2025.tif",
+            dtype='float32',
+            nodata=np.nan  # Explicitly set NoData value
+        )
+print("DONE")
