@@ -1,0 +1,84 @@
+import cftime
+import rioxarray as rxr
+import xarray as xr
+import glob
+import numpy as np
+
+# --- Helper Function: Find Deepest Non-NaN Depth Index ---
+# Find the deepest depth index with valid (non-NaN) data for each (y, x) location
+# Args: da: xarray DataArray with dimensions (time, depth, y, x)
+# Returns: depth_idx: 2D numpy array of depth indices (same shape as y, x)
+def find_deepest_non_nan_index(da):
+    mask = ~np.isnan(da.values)  # Create boolean mask for non-NaN values
+    mask_2d = mask[0]  # Extract mask for the first time step (assumes consistent across time)
+    print("Mask flipped:", mask_2d.shape)
+
+    depth_idx = np.argmax(mask_2d[::-1, :, :], axis=0)  # Find deepest valid depth index by reversing the depth axis
+    depth_idx = (mask_2d.shape[0] -1) - depth_idx  # Convert back to original depth indexing
+    return depth_idx
+
+# --- Spatial Bounds for East Antarctica ---
+min_lon = 0
+max_lon = 180
+min_lat = -70
+max_lat = -50
+
+# ---- Load and Process WOA23 Data ----
+files = glob.glob("WOA23/woa23_B5C2_annual.nc")
+
+# Load all files int oa list of datasets
+datasets = []
+for f in files:
+    ds = xr.open_dataset(f, decode_times=False)  # Disable auto time decoding
+    # Decode time using cftime (handles non-standard calendars)
+    time_values = ds["time"].values
+    time_units = ds["time"].attrs["units"]
+    calendar = ds["time"].attrs.get("calendar", "360_day")
+    ds["time"] = cftime.num2date(time_values, units=time_units, calendar=calendar)
+    datasets.append(ds)
+
+# Concatenate datasets along time 
+siconc = xr.concat(datasets, dim="time")
+
+# --- EXtract and Process Temperature Data ---
+t_sea = siconc["t_an"]  # Annual Temperature
+
+# --- Clip to Region of Interest ---
+# Create spatial masks for the East Antarctica region
+mask_lon = (t_sea.lon >= min_lon) & (t_sea.lon <= max_lon)
+mask_lat = (t_sea.lat >= min_lat) & (t_sea.lat <= max_lat)
+mask = mask_lon & mask_lat  # Combine masks
+t_sea = t_sea.where(mask, drop=True)  # Apply mask to temperature data (drop NaN values)
+
+# ---- Prepare for Geospatial Operations ---
+# Rename dimensions for rioxarray compatibility
+t_sea = t_sea.rename({"lon": "x", "lat": "y"})
+t_sea.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+t_sea.rio.write_crs("EPSG:4326", inplace=True)
+
+# ---- Extract Bottom Temperature ---
+# Find the deepest non-NaN depth index for each pixel
+depth_idx = find_deepest_non_nan_index(t_sea)
+
+# Convert depth indices to xarray DataArray for indexing
+depth_idx_da = xr.DataArray(
+    depth_idx,
+    dims=("y", "x"),
+    coords={"y" : t_sea.y, "x" : t_sea.x}
+)
+
+t_sea_bottom = t_sea.isel(depth=depth_idx_da)  # Extract bottom temperature usign the depth indices
+
+# Remove the grid_mapping attribute to avoid encoding conflicts
+if "grid_mapping" in t_sea_bottom.attrs:
+    del t_sea_bottom.attrs["grid_mapping"]
+
+# ---- Saving ----
+output_filename_bottom = f"T_Sea_2015-2022_bottom.tif"
+t_sea_bottom.rio.to_raster(
+    output_filename_bottom,
+    dtype="float32",
+    nodata=np.nan,
+)
+
+print(f"Saved bottom temperature: {output_filename_bottom}")
