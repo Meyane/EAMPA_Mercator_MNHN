@@ -1,2 +1,7 @@
 # EAMPA_Mercator_MNHN
-All data, codes and maps produced during the joint training programme between Mercator Ocean International and the MNHN in 2026.
+Codes produced during the joint training programme between Mercator Ocean International and the MNHN in 2026.
+
+ > bathymetry : IBSCO bed 2025 .tif format
+  > Quantarctica
+  > WOA23
+  > 52 GB (mémoire vive) needed for the hierarchic clustering
