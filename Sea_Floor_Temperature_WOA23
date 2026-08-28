@@ -1,0 +1,80 @@
+import cftime
+import rioxarray as rxr
+import xarray as xr
+import glob
+import numpy as np
+
+# --- Spatial Bounds for East Antarctica ---
+min_lon = 0
+max_lon = 180
+min_lat = -70
+max_lat = -50
+
+# --- Load and Preprocess Bathymetry ----
+bathymetry_da = rxr.open_rasterio("IBCSO_bed_2025.tif", masked=True).squeeze()  # Remove singleton dimensions
+bathymetry_da.rio.write_crs("EPSG:9354", inplace=True)
+bathymetry_da = bathymetry_da.where(bathymetry_da != -32768, np.nan)  # Replace fill value (-32768) with NaN
+bathymetry_da = bathymetry_da.rio.reproject("EPSG:4326")  # Reprojection
+bathymetry_da = bathymetry_da.rio.clip_box(minx=min_lon, maxx=max_lon, miny=min_lat, maxy=max_lat)  # Clip to East Antarctica region of interest
+
+# ---- Helper Function ---
+# Vectorized function to find the depth index closest to the bottom depth for each location
+# Args: depths: 1D array of depth levels; bottom: 2D array of bottom depths (bathymetry)
+# Returns: depth_idx: 2D array of depth indices (same shape as bottom)
+def find_depth_index_vectorized(depths, bottom):
+    depths_2d = depths[:, np.newaxis, np.newaxis]  # Reshape depths to (n_depths, 1, 1) for broadcasting
+    bottom_3d = bottom[np.newaxis, :, :]  # Reshape bottom to (1, n_lats, n_lon) for broadcasting
+    mask = depths_2d <= bottom_3d  # Create mask: True where depth <= bottom depth
+    idx = np.argmax(mask, axis=0)  # Find the first depth that satisfies the condition (closest to surface)
+    idx[~np.any(mask, axis=0)] = 0  # Set to 0 where no depth satisfies the condition (shallow areas)
+    return idx
+
+# ---- Load and Process WOA23 Data ---
+files = glob.glob("WOA23/woa23_B5C2_annual.nc")
+
+# Load all files into a list of datasets
+datasets = []
+for f in files:
+    ds = xr.open_dataset(f, decode_times=False)  # Disable auto time decoding
+    # Decode time using cftime (handles non-standard calendars)
+    time_values = ds["time"].values
+    time_units = ds["time"].attrs["units"]
+    calendar = ds["time"].attrs.get("calendar", "360_day")
+    ds["time"] = cftime.num2date(time_values, units=time_units, calendar=calendar)
+    datasets.append(ds)
+
+# Concatenate datasets along time dimension
+siconc = xr.concat(datasets, dim="time")
+
+# ---- Extract and Process Temperature Data ---
+t_sea = siconc["t_an"]  # Annual temperature
+
+# --- Clip to Region of Interest ---
+# Create spatial masks for the East Antarctica region
+mask_lon = (t_sea.lon >= min_lon) & (t_sea.lon <= max_lon)
+mask_lat = (t_sea.lat >= min_lat) & (t_sea.lat <= max_lat)
+mask = mask_lon & mask_lat  # Combine masks
+t_sea = t_sea.where(mask, drop=True)  # Apply mask to temperature data (drop NaN values)
+
+# ---- Prepare for Geospatial Operations ---
+# Rename dimensions for rioxarray compatibility
+t_sea = t_sea.rename({"lon": "x", "lat": "y"})
+t_sea.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+t_sea.rio.write_crs("EPSG:4326", inplace=True)
+
+# Reproject bathymetry to match temperature data resolution
+bathymetry_da_reprojected = bathymetry_da.rio.reproject_match(t_sea)
+
+# --- Save Depth Levels as GeoTIFFS
+for depth_idx in range(len(t_sea.depth)):
+    t_sea_depth = t_sea.isel(depth=depth_idx)
+    t_sea_depth.attrs = {}
+    t_sea_depth.encoding = {}
+
+    output_filename = f"T_Sea_2015-2022_{depth_idx}.tif"
+    t_sea_depth.rio.to_raster(
+        output_filename,
+        dtype="float32",
+        nodata=np.nan,
+    )
+    print(output_filename)
