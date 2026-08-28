@@ -1,0 +1,166 @@
+import xarray as xr
+import rioxarray as rxr
+import numpy as np
+import os
+import glob
+import re
+from scipy.interpolate import griddata
+
+# --- Configuration ---
+BATHY_PATH = r"C:\STAGE_Mercator.X.MHNH\Quantarctica3\Quantarctica3\EAMPA_Bathymetry\IBCSO_bed_2025.tif"
+SST_PATHS = [
+    r"C:\STAGE_Mercator.X.MHNH\EAMPA_SST_2002-2010_Obs.nc",
+    r"C:\STAGE_Mercator.X.MHNH\EAMPA_SST_2011-2025_Obs.nc"
+]
+ICE_DIR = r"C:\STAGE_Mercator.X.MHNH\Data\Mean_Trend_Ice_2003-2026"
+
+# Target grid resolution and output directory
+TARGET_RES = 0.1  # Target grid resolution in degrees (0.1°)
+OUTPUT_DIR = "C:/Users/mmarage"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Define target grid for East Antarctica region
+lon_target = np.arange(0, 180 + TARGET_RES, TARGET_RES)
+lat_target = np.arange(-70, -50 + TARGET_RES, TARGET_RES)
+
+# ---- Helper Function ----
+# Extract date (YYYY-MM) from filename
+# Args: filepath: Path to the input file
+# Returns: Date string in YYYY-MM format
+# Raises: ValueError: If date cannot be extracted from filename
+def extract_date_from_filename(filepath: str) -> str:
+    basename = os.path.basename(filepath)
+    # Pattern 1: "data_2023_02.nc" -> "2023-02"
+    match = re.search(r'(\d{4})[_-](\d{1,2})', basename)
+    if match:
+        year, month = match.groups()
+        return f"{year}-{month.zfill(2)}"
+    # Pattern 2: "data_202302.nc" -> "2023-02"
+    match = re.search(r'(\d{4})(\d{2})', basename)
+    if match:
+        year, month = match.groups()
+        return f"{year}-{month}"
+    raise ValueError(f"Could not extract date from: {basename}")
+
+# ---- Bathymetry processing (Static) -----------------
+bathy = rxr.open_rasterio(BATHY_PATH, masked=True).squeeze()
+if bathy.rio.crs is not None and bathy.rio.crs.to_epsg() != 4326:
+    bathy = bathy.rio.reproject("EPSG:4326")
+# Interpolate to target grid using nearest-neighbor
+bathy_regrid = bathy.interp(x=lon_target, y=lat_target, method='nearest')
+bathy_ds = bathy_regrid.to_dataset(name="bathy")  #Convert to Dataset
+# Standardize dimension names
+dim_names = list(bathy_ds.dims.keys())
+if len(dim_names) >= 2:
+    bathy_ds = bathy_ds.rename({dim_names[0]: 'latitude', dim_names[1]: 'longitude'})
+# Clear attributes to avoid conflicts
+for var in bathy_ds.data_vars:
+    bathy_ds[var].attrs = {}
+for coord in bathy_ds.coords:
+    bathy_ds[coord].attrs = {}
+
+bathy_ds.to_netcdf(
+    os.path.join(OUTPUT_DIR, "bathy_EA.nc")
+)
+print("Saved bathy")
+
+# --- Ice Concentration Processing ----
+ice_files = sorted(glob.glob(os.path.join(ICE_DIR, "*.nc")))
+ice_datasets = []  # List to store processed ice concentration datasets
+
+for file in ice_files:
+    print(f"  Processing {os.path.basename(file)}...")
+    try:
+        # Open dataset and extract ice_conc variable with chunking for memory efficiency
+        ds = xr.open_dataset(file, chunks={"time": 1, "y": 50, "x": 50})["ice_conc"]
+
+        # Handle multi-time files by averaging over time
+        if 'time' in ds.dims and ds.sizes['time'] > 1:
+            ds = ds.mean(dim='time', keep_attrs=True).squeeze(drop=True)
+
+        # Extract date from filename
+        date_str = extract_date_from_filename(file)
+
+        # Maps of possible coordinate names
+        coord_names = {
+            'latitude': ['latitude', 'lat', 'y', 'nav_lat', 'rlat', 'Y'],
+            'longitude': ['longitude', 'lon', 'x', 'nav_lon', 'rlon', 'X']
+        }
+        # Find actual coordinate names in the dataset
+        lat_name = next((name for name in coord_names['latitude'] if name in ds.coords), None)
+        lon_name = next((name for name in coord_names['longitude'] if name in ds.coords), None)
+
+        if not lat_name or not lon_name:
+            print(f"     Skipping: no valid lat/lon found. Available coords: {list(ds.coords.keys())}")
+            continue
+
+        # Extract coordinate and data values
+        ice_lats = ds[lat_name].values
+        ice_lons = ds[lon_name].values
+        ice_vals = ds.values
+
+        # Flatten coordinates if 1D
+        if ice_lats.ndim == 1 and ice_lons.ndim == 1:
+            lon_grid_2d, lat_grid_2d = np.meshgrid(ice_lons, ice_lats)
+            ice_lons_flat = lon_grid_2d.flatten()
+            ice_lats_flat = lat_grid_2d.flatten()
+        else:
+            ice_lons_flat = ice_lons.flatten()
+            ice_lats_flat = ice_lats.flatten()
+
+        ice_vals_flat = ice_vals.flatten()
+
+        # Remove NaN values
+        valid_mask = ~(np.isnan(ice_lats_flat) | np.isnan(ice_lons_flat) | np.isnan(ice_vals_flat))
+        ice_lats_flat = ice_lats_flat[valid_mask]
+        ice_lons_flat = ice_lons_flat[valid_mask]
+        ice_vals_flat = ice_vals_flat[valid_mask]
+
+        if len(ice_lats_flat) == 0:
+            print(f"     Skipping: no valid data after NaN removal")
+            continue
+
+        # Create target grid for interpolation
+        lon_grid, lat_grid = np.meshgrid(lon_target, lat_target)
+        # Interpolate to target grid using nearest-neighbor
+        ice_regridded = griddata(
+            (ice_lons_flat, ice_lats_flat),
+            ice_vals_flat,
+            (lon_grid, lat_grid),
+            method='nearest',
+            fill_value=np.nan
+        )
+
+        # Format date string (ensure YYYY-MM format)
+        if '-' not in date_str:
+            date_str = f"{date_str[:4]}-{date_str[4:]}"
+        # Create DataArray with target grid and add time dimension
+        ice_da = xr.DataArray(
+            ice_regridded,
+            dims=("latitude", "longitude"),
+            coords={"latitude": lat_target, "longitude": lon_target},
+            name="ice_conc"
+        ).expand_dims(time=[np.datetime64(date_str)])
+
+        ice_datasets.append(ice_da)
+        print(f"     Success! Shape: {ice_da.shape}, Time: {date_str}")
+    except Exception as e:
+        print(f"     Error: {str(e)[:100]}...")
+        continue
+
+# ---- Concatenate and Process Ice Concentration Data ----
+# Combine all datasets along time dimension
+siconc_all = xr.concat(ice_datasets, dim="time", combine_attrs="drop_conflicts", coords="minimal")
+# Select austral summer months (Dec-Mar) for ice concentration
+siconc_all = siconc_all.sel(time=siconc_all.time.dt.month.isin([12, 1, 2, 3]))
+# Subset to 2003-2025 period
+siconc_all = siconc_all.sel(time=slice("2003-01-01", "2025-12-31"))
+# Convert to dataset and resample to monthly frequency
+siconc_all = siconc_all.to_dataset(name='ice_conc')
+siconc_all = siconc_all.resample(time='1MS').mean()
+
+# Save
+siconc_all.to_netcdf(
+    os.path.join(OUTPUT_DIR, "ice_EastAntarctica.nc")
+)
+print(" Saved ice_EastAntarctica.nc ")
