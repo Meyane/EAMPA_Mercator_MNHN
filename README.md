@@ -1,6 +1,10 @@
 # EAMPA_Mercator_MNHN
 Codes produced during the joint training programme between Mercator Ocean International and the MNHN in 2026.
 
+The base maps used in QGIS to display features such as the Antarctic continent, the ocean, etc., were obtained from “Quantarctica: An Antarctic GIS package”:
+- https://qgis.org/project/case-studies/antarctica/
+- https://doi.org/10.1016/j.envsoft.2021.105015
+
 The various data sets used were retrieved via the CMEMS portal: https://data.marine.copernicus.eu/products?pk_vid=dd9828ea6d27d3b617881598795a876b
 
 Other data not retrieved via this portal are listed below:
