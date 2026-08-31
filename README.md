@@ -14,3 +14,5 @@ In the particular cas of the sea ice, which, for the period 2033–2025, was obt
 - 2023–2026: https://data.marine.copernicus.eu/product/SEAICE_GLO_SEAICE_L4_NRT_OBSERVATIONS_011_001/services  =>  osisaf_obs-si_glo_phy-sic-south_nrt_amsr2_l4_P1D-m
 
 In the case of pelagic and benthic clustering, when using the hierarchical method with Ward’s algorithm, processing all the data points (~180,000 points) requires 52 GB of RAM.
+
+If necessary, the information can also be found in my work placement report; otherwise, you can contact me at this email address: meyane.marage@orange.fr
