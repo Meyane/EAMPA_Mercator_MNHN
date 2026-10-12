@@ -12,7 +12,7 @@ Other data not retrieved via this portal are listed below:
 - WOA23 climate temperature data: https://www.ncei.noaa.gov/access/world-ocean-atlas-2023/bin/woa23.pl
 - Tracking of Adélie penguin movements: https://doi.org/10.1016/j.biocon.2025.111507
 
-In the particular cas of the sea ice, which, for the period 2033–2025, was obtained from three different data products:
+In the particular cas of the sea ice, which, for the period 2003–2025, was obtained from three different data products:
 - 2003–2020: https://data.marine.copernicus.eu/product/SEAICE_GLO_SEAICE_L4_REP_OBSERVATIONS_011_009/services  =>  osisaf_obs-si_glo_phy_sic-south_my_amsr_cdr_P1D-m
 - 2020–2023: https://osi-saf.eumetsat.int/products/osi-408-a
 - 2023–2026: https://data.marine.copernicus.eu/product/SEAICE_GLO_SEAICE_L4_NRT_OBSERVATIONS_011_001/services  =>  osisaf_obs-si_glo_phy-sic-south_nrt_amsr2_l4_P1D-m
